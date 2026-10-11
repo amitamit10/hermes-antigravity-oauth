@@ -47,6 +47,27 @@ npx commands: `install` (default), `login`, `status`, `uninstall`. Flags: `--yes
 
 Aliases: `google-antigravity`, `agy-oauth`.
 
+### Headless / remote login
+
+`agy` prints its Google OAuth URL and waits ~60 seconds for the code on its
+own TTY. When the approver is not at that terminal (SSH without a browser,
+a chat-driven host), relay the code through a file instead:
+
+```sh
+git clone https://github.com/neerazz/hermes-antigravity-oauth
+python3 hermes-antigravity-oauth/scripts/remote-login.py --code-file /tmp/agy-code.txt &
+# open the printed LOGIN_URL, approve, then:
+printf '%s' '<code>' > /tmp/agy-code.txt
+wait  # exits 0 once `agy models` confirms the session
+```
+
+The script drives agy under a PTY with only the standard library, feeds the
+code the moment it arrives (polling, not blocking on agy output — agy is
+silent during its wait, which is where naive wrappers starve), and verifies
+with `agy models`. Note: agy still allows ~60 seconds from URL to code, so
+the approver should open the URL promptly; without `--code-file` the code is
+read from stdin.
+
 ## Configuration
 
 | Env var | Default | Purpose |

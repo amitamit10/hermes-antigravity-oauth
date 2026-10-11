@@ -24,6 +24,13 @@ AGY_MARKER_BASE_URL = "agy://local"
 # users are unaffected: the new file simply does not exist and the scan
 # falls through to the legacy name.
 _TOKEN_FILENAMES = ("jetski-standalone-oauth-token", "antigravity-oauth-token")
+# Extra account homes that hold a live agy session on this fleet, searched
+# even when the current process runs under a different HOME (CLI shell vs
+# gateway service user). Entries are deduped against Path.home() below.
+_KNOWN_TOKEN_BASES = (
+    Path("/opt/data/.gemini/antigravity-cli"),
+    Path("/srv/media-ingest/hermes-service-home/.gemini/antigravity-cli"),
+)
 
 
 def _is_existing_file(path: str | Path) -> bool:
@@ -94,6 +101,10 @@ def resolve_agy_command() -> str:
         Path.home() / ".gemini" / "antigravity-cli" / "bin" / binary_name,
         Path.home() / ".local" / "bin" / binary_name,
         Path("/root/.local/bin") / binary_name,
+        # Hermes-managed install dir (Oracle host + gateway image). Kept
+        # explicit because the gateway runs with a minimal PATH where even
+        # /usr/local/bin may be missing.
+        Path("/opt/data/tools/bin") / binary_name,
         Path("/usr/local/bin") / binary_name,
         Path("/usr/bin") / binary_name,
     ]
@@ -130,12 +141,17 @@ def resolve_real_token_path() -> Path | None:
     home_base = Path.home() / ".gemini" / "antigravity-cli"
     root_base = Path("/root/.gemini/antigravity-cli")
     candidates = [home_base / name for name in _TOKEN_FILENAMES]
-    # Last resort for containers/sudo contexts where HOME does not point
-    # at the account that ran `agy`. All home candidates win over any
-    # /root fallback so a stale /root legacy token never beats the user's
-    # current token. Skip the extra stat when HOME already is /root.
-    if root_base != home_base:
-        candidates += [root_base / name for name in _TOKEN_FILENAMES]
+    # Known fleet homes (CLI shell vs gateway service user): searched after
+    # the current HOME so the running account's own session always wins, and
+    # deduped so an entry equal to HOME is not statted twice.
+    for known_base in _KNOWN_TOKEN_BASES + (root_base,):
+        if known_base == home_base:
+            continue
+        # Last resort for containers/sudo contexts where HOME does not point
+        # at the account that ran `agy`. All home candidates win over any
+        # fallback so a stale legacy token never beats the user's current
+        # token.
+        candidates += [known_base / name for name in _TOKEN_FILENAMES]
     for candidate in candidates:
         if _is_existing_file(candidate):
             return candidate

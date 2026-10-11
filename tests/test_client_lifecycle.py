@@ -996,5 +996,160 @@ class StaleStreamFinalizationTests(unittest.TestCase):
         )
 
 
+class _RealPollFakeProc:
+    """A Popen stand-in with REAL post-terminate() poll() semantics.
+
+    ``MagicMock().poll.return_value`` is hardcoded forever -- it never
+    reflects that terminate()/kill() was actually called, so a mocked test
+    using one cannot distinguish "still alive" from "we just killed this on
+    purpose" the way a real ``subprocess.Popen`` does. This fake flips
+    poll() from None to a real exit code only once terminate()/kill() runs,
+    which is exactly the fidelity needed to pin the bug below.
+    """
+
+    def __init__(self, lines, exit_code=1):
+        self._lines = list(lines) + [""]
+        self._idx = 0
+        self._terminated = False
+        self._exit_code = exit_code
+        self.stdin = MagicMock()
+        self.stderr = MagicMock(read=lambda: "")
+        self.stdout = MagicMock(readline=self._readline)
+        self.pid = 999999
+
+    def _readline(self):
+        if self._idx < len(self._lines):
+            line = self._lines[self._idx]
+            self._idx += 1
+            return (line + "\n") if line else ""
+        return ""
+
+    def poll(self):
+        return self._exit_code if self._terminated else None
+
+    def terminate(self):
+        self._terminated = True
+
+    def kill(self):
+        self._terminated = True
+
+    def wait(self, timeout=None):
+        if not self._terminated:
+            raise TimeoutError("not terminated")
+        return self._exit_code
+
+
+class TestNeutralizedToolStepDoesNotMisreportAsACrash(unittest.TestCase):
+    """Regression for the antigravity-oauth fast-crash (task t_004f4153).
+
+    Root cause (confirmed via errors.log/agent.log correlation on gaia):
+    every "Antigravity execution failed: worker process exited with return
+    code 1" failure is preceded within ~1s by exactly one "...neutralizing
+    to prevent host execution." warning. stream.py's step_update handler
+    deliberately tears down the worker on an unmappable native tool step
+    (``self.close()``) and sets ``neutralized_tool_step = True`` -- but the
+    exit-code check right after it (`if not has_tool_calls and not
+    has_content and worker_exit not in (None, 0): raise ...`) did not carry
+    the same ``not neutralized_tool_step`` guard already present on the
+    sibling "empty result" raise, so the deliberate teardown's own nonzero
+    exit code was reported as a crash every time. Fixed by adding the
+    missing guard on both the worker-path and oneshot-path checks.
+
+    ``test_native_tool_step_neutralization_in_stream`` in
+    ``test_antigravity_plugin.py`` does not catch this: its mock hardcodes
+    ``poll.return_value = None`` forever and stubs ``_terminate_process``
+    out entirely, so poll() never reflects a real post-kill exit code. This
+    test uses ``_RealPollFakeProc`` instead, which flips poll() to a real
+    nonzero code only once terminate() actually runs -- reproducing the
+    real race.
+    """
+
+    def setUp(self) -> None:
+        _pin_host_dependent_seams(self)
+        temp_dir = tempfile.TemporaryDirectory(prefix="hermes_agy_test_")
+        self.addCleanup(temp_dir.cleanup)
+        self.client = AntigravityClient(cwd=temp_dir.name)
+        self.addCleanup(self.client.close)
+
+    def test_unmappable_native_tool_step_does_not_raise(self):
+        events = [
+            json.dumps({"event": "init", "conversation_id": "test-neutralize"}),
+            json.dumps({
+                "event": "step_update",
+                "step_update": {
+                    "step_type": "tool",
+                    "tool_name": "run_command",
+                    "tool_info": {"name": "run_command", "parameters": {"CommandLine": "echo hi"}},
+                },
+            }),
+        ]
+        proc = _RealPollFakeProc(events, exit_code=1)
+        self.client._worker_proc = proc
+        self.client._worker_model = MODEL
+        self.client._worker_effort = None
+        self.client._active_processes.add(proc)
+        # Point real termination at the fake so close() ACTUALLY flips
+        # poll() like a real killed child would (see _RealPollFakeProc).
+        self.client._terminate_process = lambda p: p.terminate()
+
+        stream = AntigravityStream(
+            proc=proc,
+            client=self.client,
+            model=MODEL,
+            timeout=30.0,
+            tools=[],  # no "terminal" tool offered -> run_command is unmappable
+            is_worker=True,
+            worker_lock=self.client._worker_lock,
+            worker_lock_held=True,
+            messages=list(TURN_MESSAGES),
+            usage_baseline={},
+        )
+
+        chunks = list(stream)  # must not raise
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0].choices[0].finish_reason, "stop")
+        self.assertTrue(proc.poll() not in (None, 0), "fake must report a real post-kill exit code")
+
+    def test_genuine_worker_crash_surfaces_stderr_in_the_raised_message(self):
+        """A REAL crash (no neutralization) must still raise -- and now with detail.
+
+        Companion to the neutralization regression above: this pins the
+        other half of the task t_004f4153 finding -- the worker-path
+        exit-code raise used to carry ZERO diagnostic detail (unlike the
+        oneshot path's equivalent check, which already read stderr), so a
+        genuine agy crash was indistinguishable from the neutralization
+        false-positive this file's other test fixes. Both must raise with
+        the stderr content now included; only the neutralization case must
+        not raise at all.
+        """
+        proc = _RealPollFakeProc([], exit_code=1)  # no events at all: agy died immediately
+        proc.stderr = MagicMock(read=lambda: "agy: fatal: some real startup failure\n")
+        self.client._worker_proc = proc
+        self.client._worker_model = MODEL
+        self.client._worker_effort = None
+        self.client._active_processes.add(proc)
+        self.client._terminate_process = lambda p: p.terminate()
+        proc.terminate()  # already "dead" before the stream even starts reading
+
+        stream = AntigravityStream(
+            proc=proc,
+            client=self.client,
+            model=MODEL,
+            timeout=30.0,
+            tools=[],
+            is_worker=True,
+            worker_lock=self.client._worker_lock,
+            worker_lock_held=True,
+            messages=list(TURN_MESSAGES),
+            usage_baseline={},
+        )
+
+        with self.assertRaises(RuntimeError) as ctx:
+            list(stream)
+        message = str(ctx.exception)
+        self.assertIn("worker process exited with return code 1", message)
+        self.assertIn("agy: fatal: some real startup failure", message)
+
+
 if __name__ == "__main__":
     unittest.main()

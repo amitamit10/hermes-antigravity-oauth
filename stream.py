@@ -720,6 +720,23 @@ class AntigravityStream(Iterator[Any]):
                 # `not in (None, 0)` test as the worker branch.
                 returncode = self.proc.poll()
 
+                # `not neutralized_tool_step`: a security neutralization a few
+                # lines above (unmappable native tool step) deliberately
+                # calls self.close(), which terminates THIS process on
+                # purpose -- the resulting nonzero exit code is the expected
+                # effect of that termination, not evidence of a crash. Without
+                # this guard every neutralization was misreported as
+                # "Antigravity execution failed: ... exited with return code
+                # N", Hermes retried the turn up to 3 times (each retry
+                # re-triggered the same neutralization), and the turn failed
+                # with "didn't answer after 3 attempts" -- confirmed by
+                # errors.log/agent.log correlation: 100% of these exit-code
+                # failures are preceded within ~1s by the neutralization
+                # warning (see repro_neutralization_crash.py, task
+                # t_004f4153). Mirrors the guard already on the "empty
+                # result" raise below (`if not neutralized_tool_step and not
+                # success:`), which this one was missing.
+
                 if self._early_error:
                     raise RuntimeError(f"Antigravity model error: {self._early_error}")
 
@@ -747,7 +764,7 @@ class AntigravityStream(Iterator[Any]):
                 # produced nothing is the empty-result raise's job below,
                 # not this exit-code one. A real nonzero exit keeps the
                 # quota/exit-code raise's priority over the generic one.
-                if not has_tool_calls and not has_content and returncode not in (None, 0):
+                if not neutralized_tool_step and not has_tool_calls and not has_content and returncode not in (None, 0):
                     quota_err = _check_early_quota_error(gemini_dir, min_mtime=start_time)
                     if quota_err:
                         raise RuntimeError(f"Antigravity model error: {quota_err}")
@@ -804,11 +821,33 @@ class AntigravityStream(Iterator[Any]):
                     raise RuntimeError(f"Antigravity model error: {error_msg}")
 
                 worker_exit = self.proc.poll()
-                if not has_tool_calls and not has_content and worker_exit not in (None, 0):
+                # `not neutralized_tool_step`: see the matching comment on the
+                # oneshot-path exit-code check above -- a deliberate
+                # self.close() from a security neutralization must not be
+                # reported as this worker crashing. This was the unguarded
+                # twin of the (correctly guarded) "empty result" raise below
+                # and is the confirmed root cause of the antigravity-oauth
+                # fast-crash ("worker process exited with return code 1" /
+                # "didn't answer after 3 attempts"), task t_004f4153.
+                if not neutralized_tool_step and not has_tool_calls and not has_content and worker_exit not in (None, 0):
                     quota_err = _check_early_quota_error(gemini_dir, min_mtime=start_time)
                     if quota_err:
                         raise RuntimeError(f"Antigravity model error: {quota_err}")
-                    raise RuntimeError(f"Antigravity execution failed: worker process exited with return code {worker_exit}")
+                    # Surface whatever agy wrote to stderr before this crash:
+                    # without it, Hermes could not tell "agy answered
+                    # nothing" from "agy printed its own error and this
+                    # raise threw it away" (task t_004f4153 finding -- this
+                    # message used to carry zero diagnostic detail, unlike
+                    # the oneshot path's equivalent check above, which
+                    # already reads stderr on its own exit-code raise). The
+                    # worker is dead at this point (worker_exit is not
+                    # None), so draining its stderr pipe here is a bounded,
+                    # one-time read, not a hot-path cost.
+                    worker_stderr = (self.proc.stderr.read() if self.proc.stderr else "").strip()
+                    detail = f"worker process exited with return code {worker_exit}"
+                    if worker_stderr:
+                        detail += f"; stderr: {worker_stderr}"
+                    raise RuntimeError(f"Antigravity execution failed: {detail}")
 
                 # Positive-evidence verdict, placed AFTER the quota and
                 # exit-code checks (the more specific signals) and BEFORE the

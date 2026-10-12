@@ -681,6 +681,14 @@ class AntigravityPluginTests(unittest.TestCase):
         verdict4 = hook(RuntimeError("Invalid API key or unauthorized"))
         self.assertIsNone(verdict4)
 
+        # Test quota limit
+        verdict_quota = hook(RuntimeError("Antigravity model error: Individual quota reached"))
+        self.assertEqual(verdict_quota, {"reason": "rate_limit", "retryable": True, "should_fallback": True})
+
+        # Test auth error
+        verdict_auth = hook(RuntimeError("Antigravity CLI is not authenticated. Please run 'agy'"))
+        self.assertEqual(verdict_auth, {"reason": "auth_login_required", "retryable": False})
+
     def test_hermes_error_classifier_integration(self):
         try:
             from agent.error_classifier import classify_api_error, FailoverReason

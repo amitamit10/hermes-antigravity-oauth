@@ -257,6 +257,32 @@ def _classify_antigravity_error(
             "retryable": True,
             "should_compress": True,
         }
+    if any(
+        pattern in err_str
+        for pattern in (
+            "individual quota reached",
+            "quota exceeded",
+            "resource_exhausted",
+            "resource exhausted",
+        )
+    ):
+        return {
+            "reason": "rate_limit",
+            "retryable": True,
+            "should_fallback": True,
+        }
+    if any(
+        pattern in err_str
+        for pattern in (
+            "antigravity cli is not authenticated",
+            "oauth token expired",
+            "token has expired",
+        )
+    ):
+        return {
+            "reason": "auth_login_required",
+            "retryable": False,
+        }
     return None
 
 

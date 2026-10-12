@@ -7,6 +7,7 @@ existing Antigravity / Gemini subscription quota.
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import json
 import logging
@@ -306,6 +307,9 @@ class AntigravityClient:
         # session cannot corrupt a later session's baseline.
         self._worker_usage_baseline: dict[str, int] = {}
         self._worker_lock = threading.Lock()
+        # Register atexit handler so unhandled exits (e.g. oneshot mode or unclosed sessions)
+        # terminate any background agy worker and remove the temp directory cleanly (issue #4).
+        atexit.register(self.close)
 
     @staticmethod
     def _resolve_real_token_path() -> Path | None:
@@ -332,6 +336,8 @@ class AntigravityClient:
         self.close()
 
     def close(self) -> None:
+        with contextlib.suppress(Exception):
+            atexit.unregister(self.close)
         # Phase 1 -- terminate every child process BEFORE the workspace is
         # touched (issue #4): on Windows a still-running agy keeps
         # conversations/*.db open, and taskkill /F /T is asynchronous, so
@@ -344,6 +350,8 @@ class AntigravityClient:
             self._active_processes.clear()
         for proc in procs:
             self._terminate_process(proc)
+        # Phase 1.5 -- sync back refreshed token if agy replaced the symlink
+        self._sync_back_refreshed_token()
         # Phase 2 -- remove the private workspace, retrying transient
         # failures. close() must never raise from cleanup and must never
         # leave the client half-closed (issue #4).
@@ -427,6 +435,30 @@ class AntigravityClient:
                 break
         if temp_dir.name:
             _force_rmtree(temp_dir.name)
+
+    def _sync_back_refreshed_token(self) -> None:
+        """If agy refreshed the OAuth token inside the isolated home, sync it back.
+
+        agy writes refreshed tokens atomically by replacing the file. That breaks the symlink
+        linking isolated_token to real_token, turning isolated_token into a regular file.
+        Before the workspace is deleted, sync the freshly refreshed token back to real_token
+        so subsequent requests and sessions keep the refreshed credentials.
+        """
+        try:
+            real_token = resolve_real_token_path()
+            if not real_token or not self._isolated_gemini_dir:
+                return
+            isolated_token = self._isolated_gemini_dir / real_token.name
+            if isolated_token.is_file() and not os.path.islink(isolated_token):
+                if isolated_token.stat().st_size > 10:
+                    shutil.copy2(isolated_token, real_token)
+                    logger.debug(
+                        "Synced refreshed OAuth token from %s back to %s",
+                        isolated_token,
+                        real_token,
+                    )
+        except Exception as exc:
+            logger.debug("Failed to sync back refreshed OAuth token: %s", exc)
 
     def _terminate_worker_locked(self) -> None:
         if self._worker_proc is not None:

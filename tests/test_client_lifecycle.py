@@ -1151,5 +1151,41 @@ class TestNeutralizedToolStepDoesNotMisreportAsACrash(unittest.TestCase):
         self.assertIn("agy: fatal: some real startup failure", message)
 
 
+class TestTokenSyncAndAtexitLifecycle(unittest.TestCase):
+    """Lifecycle tests for atexit registration and token sync on exit (issues #4 and token persistence)."""
+
+    def setUp(self) -> None:
+        _pin_host_dependent_seams(self)
+        self.temp_dir = tempfile.TemporaryDirectory(prefix="hermes_agy_test_")
+        self.addCleanup(self.temp_dir.cleanup)
+
+    def test_atexit_registered_and_unregistered_on_close(self):
+        client = AntigravityClient(cwd=self.temp_dir.name)
+        self.assertFalse(client.is_closed)
+        client.close()
+        self.assertTrue(client.is_closed)
+
+    def test_sync_back_refreshed_token_when_symlink_replaced(self):
+        with tempfile.TemporaryDirectory() as token_dir:
+            real_token = Path(token_dir) / "antigravity-oauth-token"
+            real_token.write_text("initial_token_content_here", encoding="utf-8")
+
+            with (
+                patch("process.resolve_real_token_path", return_value=real_token),
+                patch("client.resolve_real_token_path", return_value=real_token),
+            ):
+                client = AntigravityClient(cwd=self.temp_dir.name)
+                isolated_token = client._isolated_gemini_dir / real_token.name
+                self.assertTrue(isolated_token.exists())
+
+                # Simulate agy atomic token refresh (replacing the symlink with a regular file)
+                if isolated_token.is_symlink():
+                    isolated_token.unlink()
+                isolated_token.write_text("refreshed_token_updated_by_agy", encoding="utf-8")
+
+                client.close()
+                self.assertEqual(real_token.read_text(encoding="utf-8"), "refreshed_token_updated_by_agy")
+
+
 if __name__ == "__main__":
     unittest.main()

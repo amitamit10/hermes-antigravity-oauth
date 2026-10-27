@@ -194,8 +194,8 @@ class AntigravityOAuthProfile(ProviderProfile):
         """Declared context window for Antigravity CLI.
 
         Reads limit.context from models_dev_cache.json when present (which reflects the
-        1M/200k specs of Gemini / Claude / GPT models). Falls back to the standard 200k
-        floor when the cache has no entry for this id.
+        1M/200k specs of Gemini / Claude / GPT models). An id the catalog does not list
+        returns None, so Hermes keeps resolving instead of substituting one number.
         """
         env_val = os.environ.get("ANTIGRAVITY_CONTEXT_LENGTH")
         if env_val:
@@ -210,8 +210,7 @@ class AntigravityOAuthProfile(ProviderProfile):
         except ImportError:
             from context_window import context_length_for
 
-        found = context_length_for(model)
-        return found if found is not None else 200_000
+        return context_length_for(model)
 
     def classify_api_error(
         self,

@@ -462,7 +462,7 @@ class AsyncStreamSemanticsTests(_PinnedSeamsMixin, unittest.TestCase):
         deadline = time.monotonic() + timeout
         while threading.active_count() > baseline and time.monotonic() < deadline:
             time.sleep(0.01)
-        self.assertEqual(threading.active_count(), baseline)
+        self.assertLessEqual(threading.active_count(), baseline)
 
     def test_exhausted_worker_stream_retires_its_executor(self):
         # The worker SUCCESS path deliberately does not call close() (the

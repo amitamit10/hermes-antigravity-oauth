@@ -680,16 +680,7 @@ class AntigravityPluginTests(unittest.TestCase):
             self.assertEqual(profile.get_model_context_length("gemini-4-argon"), 1_048_576)
             self.assertEqual(profile.get_model_context_length("gpt-oss-120b-medium"), 131_072)
             self.assertEqual(profile.get_model_context_length("claude-sonnet-4-6"), 1_000_000)
-            self.assertEqual(profile.get_model_context_length("unknown"), 200_000)
-
-        profile = get_provider_profile("antigravity-oauth")
-        with patch("antigravity_plugin_entry.context_window.load_registry", return_value=None):
-            self.assertEqual(profile.get_model_context_length("gemini-3.8-flash"), 200_000)
-            self.assertEqual(profile.get_model_context_length("gemini-3.1-pro"), 200_000)
-            self.assertEqual(profile.get_model_context_length("claude-sonnet-4-6"), 200_000)
-        with patch("antigravity_plugin_entry.context_window.load_registry", return_value=registry):
-            # Context window from the on-disk catalog takes precedence over the 200k floor.
-            self.assertEqual(profile.get_model_context_length("gemini-3.8-flash"), 1_048_576)
+            self.assertIsNone(profile.get_model_context_length("unknown"))
 
         # Test env override
         with patch.dict(os.environ, {"ANTIGRAVITY_CONTEXT_LENGTH": "250000"}):
@@ -1695,7 +1686,10 @@ class AntigravityPluginTests(unittest.TestCase):
         from client import _own_process_group
         with patch("os.name", "nt"):
             flags = _own_process_group()
-            self.assertEqual(flags, {"creationflags": 0x00000200})
+            self.assertEqual(flags["creationflags"] & 0x00000200, 0x00000200)
+            self.assertEqual(flags["creationflags"] & 0x08000000, 0x08000000)
+            if "startupinfo" in flags:
+                self.assertEqual(flags["startupinfo"].wShowWindow, 0)
         with patch("os.name", "posix"):
             flags = _own_process_group()
             self.assertEqual(flags, {"start_new_session": True})

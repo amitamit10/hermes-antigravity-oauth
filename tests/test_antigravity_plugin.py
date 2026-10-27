@@ -645,15 +645,51 @@ class AntigravityPluginTests(unittest.TestCase):
         self.assertIsNotNone(models)
         # Verify deduplicated clean base names
         self.assertIn("gemini-3.8-flash", models)
-        self.assertIn("gemini-3.1-pro", models)
         self.assertNotIn("gemini-3.8-flash-high", models)
         self.assertNotIn("gemini-3.8-flash-medium", models)
 
     def test_profile_get_model_context_length(self):
+        from context_window import context_length_for
+
+        registry = {
+            "google": {"models": {
+                "gemini-4-argon": {"limit": {"context": 1_048_576}},
+                "gemini-3.8-flash": {"limit": {"context": 1_048_576}},
+                "gemini-3-pro-image": {"limit": {"context": 65_536}},
+            }},
+            "anthropic": {"models": {
+                "claude-sonnet-4-6": {"limit": {"context": 1_000_000}},
+            }},
+            "groq": {"models": {
+                "openai/gpt-oss-120b": {"limit": {"context": 131_072}},
+            }},
+            "perplexity-agent": {"models": {
+                "anthropic/claude-sonnet-4-6": {"limit": {"context": 200_000}},
+            }},
+        }
+        self.assertEqual(context_length_for("gemini-4-argon", registry), 1_048_576)
+        self.assertEqual(context_length_for("gemini-4-argon-high", registry), 1_048_576)
+        self.assertEqual(context_length_for("gemini-3.8-flash", registry), 1_048_576)
+        self.assertEqual(context_length_for("gemini-3-pro-image", registry), 65_536)
+        self.assertEqual(context_length_for("claude-sonnet-4-6", registry), 1_000_000)
+        self.assertEqual(context_length_for("gpt-oss-120b-medium", registry), 131_072)
+        self.assertIsNone(context_length_for("not-a-real-model", registry))
+
+        profile = _pkg.antigravity_profile
+        with patch("antigravity_plugin_entry.context_window.load_registry", return_value=registry):
+            self.assertEqual(profile.get_model_context_length("gemini-4-argon"), 1_048_576)
+            self.assertEqual(profile.get_model_context_length("gpt-oss-120b-medium"), 131_072)
+            self.assertEqual(profile.get_model_context_length("claude-sonnet-4-6"), 1_000_000)
+            self.assertEqual(profile.get_model_context_length("unknown"), 200_000)
+
         profile = get_provider_profile("antigravity-oauth")
-        self.assertEqual(profile.get_model_context_length("gemini-3.8-flash"), 200_000)
-        self.assertEqual(profile.get_model_context_length("gemini-3.1-pro"), 200_000)
-        self.assertEqual(profile.get_model_context_length("claude-sonnet-4-6"), 200_000)
+        with patch("antigravity_plugin_entry.context_window.load_registry", return_value=None):
+            self.assertEqual(profile.get_model_context_length("gemini-3.8-flash"), 200_000)
+            self.assertEqual(profile.get_model_context_length("gemini-3.1-pro"), 200_000)
+            self.assertEqual(profile.get_model_context_length("claude-sonnet-4-6"), 200_000)
+        with patch("antigravity_plugin_entry.context_window.load_registry", return_value=registry):
+            # Context window from the on-disk catalog takes precedence over the 200k floor.
+            self.assertEqual(profile.get_model_context_length("gemini-3.8-flash"), 1_048_576)
 
         # Test env override
         with patch.dict(os.environ, {"ANTIGRAVITY_CONTEXT_LENGTH": "250000"}):

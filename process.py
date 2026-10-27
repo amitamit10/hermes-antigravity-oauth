@@ -75,8 +75,11 @@ def hidden_console_kwargs() -> dict[str, Any]:
     try:
         return _load_console_hide().hide_kwargs({})
     except Exception:
-        info = subprocess.STARTUPINFO()
-        info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo_cls = getattr(subprocess, "STARTUPINFO", None)
+        if startupinfo_cls is None:
+            return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)}
+        info = startupinfo_cls()
+        info.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
         info.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
         return {
             "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
@@ -95,10 +98,14 @@ def _own_process_group() -> dict[str, Any]:
     if os.name == "nt":
         flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
         flags |= getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-        info = subprocess.STARTUPINFO()
-        info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        info.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
-        return {"creationflags": flags, "startupinfo": info}
+        kwargs: dict[str, Any] = {"creationflags": flags}
+        startupinfo_cls = getattr(subprocess, "STARTUPINFO", None)
+        if startupinfo_cls is not None:
+            info = startupinfo_cls()
+            info.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
+            info.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+            kwargs["startupinfo"] = info
+        return kwargs
     return {"start_new_session": True}
 
 

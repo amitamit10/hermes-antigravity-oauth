@@ -192,10 +192,10 @@ class AntigravityOAuthProfile(ProviderProfile):
 
     def get_model_context_length(self, model: str) -> int | None:
         """Declared context window for Antigravity CLI.
-        
-        Defaults to 200,000 tokens (allowing conversations to comfortably pass
-        140k-160k tokens before auto-compression). Configurable via the
-        ANTIGRAVITY_CONTEXT_LENGTH environment variable.
+
+        Reads limit.context from models_dev_cache.json when present (which reflects the
+        1M/200k specs of Gemini / Claude / GPT models). Falls back to the standard 200k
+        floor when the cache has no entry for this id.
         """
         env_val = os.environ.get("ANTIGRAVITY_CONTEXT_LENGTH")
         if env_val:
@@ -205,7 +205,13 @@ class AntigravityOAuthProfile(ProviderProfile):
                     return val
             except ValueError:
                 pass
-        return 200_000
+        try:
+            from .context_window import context_length_for
+        except ImportError:
+            from context_window import context_length_for
+
+        found = context_length_for(model)
+        return found if found is not None else 200_000
 
     def classify_api_error(
         self,

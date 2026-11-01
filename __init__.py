@@ -269,6 +269,9 @@ def _classify_antigravity_error(
             "quota exceeded",
             "resource_exhausted",
             "resource exhausted",
+            "eligibility check failed",
+            "not currently available in your location",
+            "account ineligible",
         )
     ):
         return {
@@ -311,7 +314,7 @@ antigravity_profile = AntigravityOAuthProfile(
     process_args_env_var="ANTIGRAVITY_ARGS",
     default_aux_model="gemini-3.8-flash",
     fallback_models=_FALLBACK_MODELS,
-    supports_vision=True,
+    supports_vision=False,
     classify_api_error=_classify_antigravity_error,
     auth_handler=antigravity_auth_handler,
 )

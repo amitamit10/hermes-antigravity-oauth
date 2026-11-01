@@ -84,7 +84,7 @@ def resolve_model_and_effort(
         # gemini-3.1-pro only has -low and -high in agy
         concrete_effort = "low" if effort == "low" else "high"
         return f"{base_model}-{concrete_effort}", concrete_effort
-    elif base_model.startswith("gemini-") and "flash" in base_model:
+    elif base_model.startswith("gemini-") and not base_model.endswith("-image"):
         concrete_effort = effort if effort in ("low", "medium", "high") else "medium"
         return f"{base_model}-{concrete_effort}", concrete_effort
     else:

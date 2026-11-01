@@ -49,6 +49,8 @@ def _render_message_content(content: Any) -> str:
             elif isinstance(item, dict):
                 if item.get("type") == "text":
                     parts.append(str(item.get("text") or "").strip())
+                elif item.get("type") == "image_url" or "image_url" in item:
+                    parts.append("[image omitted: antigravity-oauth does not support multimodal image inputs]")
                 elif "content" in item:
                     parts.append(str(item.get("content") or "").strip())
         return "\n".join(p for p in parts if p).strip()

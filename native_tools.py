@@ -38,15 +38,42 @@ def _terminal(p: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _read_file(p: dict[str, Any]) -> dict[str, Any] | None:
-    path = _pick(p, "AbsolutePath", "path", "file_path", "FilePath")
+    path = _pick(p, "AbsolutePath", "path", "file_path", "FilePath", "Path")
     if not path:
         return None
     out: dict[str, Any] = {"path": str(path)}
-    if (start := _pick(p, "StartLine", "offset")) is not None:
+    start = _pick(p, "StartLine", "offset", "start_line", "start")
+    if start is not None:
         try:
             out["offset"] = max(1, int(start))
         except (TypeError, ValueError):
             pass
+    end = _pick(p, "EndLine", "end_line", "end")
+    if end is not None and start is not None:
+        try:
+            s_val = max(1, int(start))
+            e_val = int(end)
+            if e_val >= s_val:
+                out["limit"] = e_val - s_val + 1
+        except (TypeError, ValueError):
+            pass
+    elif (lim := _pick(p, "limit", "Limit")) is not None:
+        try:
+            out["limit"] = max(1, int(lim))
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
+def _patch(p: dict[str, Any]) -> dict[str, Any] | None:
+    path = _pick(p, "Path", "path", "AbsolutePath", "file_path", "FilePath")
+    old = _pick(p, "Target", "old_string", "old_str", "old_text", "old")
+    new = _pick(p, "Replacement", "new_string", "new_str", "new_text", "new")
+    if not path or old is None or new is None:
+        return None
+    out: dict[str, Any] = {"path": str(path), "old_string": str(old), "new_string": str(new)}
+    if (rep_all := _pick(p, "replace_all", "replaceAll")) is not None:
+        out["replace_all"] = bool(rep_all)
     return out
 
 
@@ -95,6 +122,8 @@ NATIVE_TO_HERMES: dict[str, tuple[str, Mapper]] = {
     "read_file": ("read_file", _read_file),
     "write_to_file": ("write_file", _write_file),
     "write_file": ("write_file", _write_file),
+    "edit_file": ("patch", _patch),
+    "patch": ("patch", _patch),
     "grep_search": ("search_files", _search_content),
     "find_by_name": ("search_files", _search_files),
     "search_files": ("search_files", _search_files),

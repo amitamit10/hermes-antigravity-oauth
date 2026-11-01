@@ -143,9 +143,12 @@ def _format_messages_as_prompt(
             parts = []
             if "Tool Result (" in rendered_content:
                 rendered_content = rendered_content.split("Tool Result (")[0].strip()
+            if tool_calls := message.get("tool_calls"):
+                # Strip any raw <tool_call> blocks from rendered content to avoid duplicate emission
+                rendered_content = re.sub(r"<tool_call>.*?<\/tool_call>", "", rendered_content, flags=re.DOTALL).strip()
             if rendered_content:
                 parts.append(rendered_content)
-            if tool_calls := message.get("tool_calls"):
+            if tool_calls:
                 for tc in tool_calls:
                     if isinstance(tc, dict):
                         fn = tc.get("function") or {}
@@ -229,9 +232,11 @@ def _format_delta_prompt(new_messages: Sequence[dict[str, Any]]) -> str:
             subparts = []
             if "Tool Result (" in rendered_content:
                 rendered_content = rendered_content.split("Tool Result (")[0].strip()
+            if tool_calls := msg.get("tool_calls"):
+                rendered_content = re.sub(r"<tool_call>.*?<\/tool_call>", "", rendered_content, flags=re.DOTALL).strip()
             if rendered_content:
                 subparts.append(rendered_content)
-            if tool_calls := msg.get("tool_calls"):
+            if tool_calls:
                 for tc in tool_calls:
                     if isinstance(tc, dict):
                         fn = tc.get("function") or {}

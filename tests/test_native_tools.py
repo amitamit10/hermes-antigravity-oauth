@@ -44,6 +44,29 @@ class TranslateTests(unittest.TestCase):
         c = native_tools.translate(_step("grep_search", {"Query": "foo", "SearchPath": "/r"}), {"search_files"}, 0)
         self.assertEqual(json.loads(c.function.arguments), {"pattern": "foo", "target": "content", "path": "/r"})
 
+    def test_edit_file_and_patch_mapping(self):
+        c = native_tools.translate(
+            _step("edit_file", {"Path": "/a.py", "Target": "old", "Replacement": "new"}),
+            {"patch"},
+            0,
+        )
+        self.assertIsNotNone(c)
+        assert c is not None
+        self.assertEqual(c.function.name, "patch")
+        self.assertEqual(json.loads(c.function.arguments), {"path": "/a.py", "old_string": "old", "new_string": "new"})
+
+    def test_read_file_line_range_limit(self):
+        c = native_tools.translate(
+            _step("read_file", {"Path": "/a.py", "StartLine": 10, "EndLine": 25}),
+            {"read_file"},
+            0,
+        )
+        self.assertIsNotNone(c)
+        assert c is not None
+        args = json.loads(c.function.arguments)
+        self.assertEqual(args["offset"], 10)
+        self.assertEqual(args["limit"], 16)
+
 
 class StreamBridgeTests(unittest.TestCase):
     def _run(self, events, tools):

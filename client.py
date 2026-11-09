@@ -50,7 +50,7 @@ try:
         _parse_tool_block,
         _render_message_content,
     )
-    from .stream import AntigravityStream, collect_stream_completion
+    from .stream import AntigravityStream, collect_stream_completion, _close_stdout_line_reader
     from . import soul as _soul
 except ImportError:
     from models import (
@@ -80,7 +80,7 @@ except ImportError:
         _parse_tool_block,
         _render_message_content,
     )
-    from stream import AntigravityStream, collect_stream_completion
+    from stream import AntigravityStream, collect_stream_completion, _close_stdout_line_reader
     import soul as _soul
 
 logger = logging.getLogger(__name__)
@@ -327,6 +327,7 @@ class AntigravityClient:
 
     @staticmethod
     def _terminate_process(proc: subprocess.Popen) -> None:
+        _close_stdout_line_reader(proc)
         terminate_process(proc)
 
     def __enter__(self) -> "AntigravityClient":
@@ -604,7 +605,7 @@ class AntigravityClient:
         *,
         model: str | None = None,
         messages: list[dict[str, Any]] | None = None,
-        timeout: float | None = None,
+        timeout: Any = None,
         tools: list[dict[str, Any]] | None = None,
         tool_choice: Any = None,
         stream: bool = False,
@@ -623,6 +624,12 @@ class AntigravityClient:
         effort_param = reasoning_effort or extra_kwargs.get("reasoning_effort")
         resolved_model, effort = self._resolve_model_and_effort(model, effort_param)
         messages_list = list(messages or [])
+        # Hermes' streaming caller can pass an httpx.Timeout rather than a
+        # scalar. Use its read budget so long generations do not inherit the
+        # plugin's shorter default; None means no read deadline.
+        if hasattr(timeout, "read"):
+            read_timeout = getattr(timeout, "read")
+            timeout = float("inf") if read_timeout is None else read_timeout
         effective_timeout = (
             float(timeout)
             if isinstance(timeout, (int, float)) and timeout > 0

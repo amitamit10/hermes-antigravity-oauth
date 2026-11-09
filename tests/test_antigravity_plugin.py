@@ -6,10 +6,12 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import MagicMock, patch
 
 # Add plugin parent dir to sys.path
@@ -27,6 +29,7 @@ from client import (
     resolve_agy_command,
 )
 from process import _check_early_quota_error
+from stream import _StdoutLineReader, _stdout_line_reader
 
 # Load the plugin's package entry as a real package (not a plain module) so its
 # `from .client import ...` relative imports resolve. Hermes itself discovers a
@@ -88,6 +91,30 @@ class AntigravityPluginTests(unittest.TestCase):
         self.assertIsNotNone(profile.auth_handler)
         self.assertEqual(profile.auth_type, "external_process")
         self.assertEqual(profile.api_mode, "chat_completions")
+
+    def test_external_process_provider_streaming_is_opted_in(self):
+        from dataclasses import fields
+        from providers.base import ProviderProfile
+
+        if "supports_streaming" not in {field.name for field in fields(ProviderProfile)}:
+            self.skipTest("this Hermes version predates external-process streaming opt-in")
+
+        profile = get_provider_profile("antigravity-oauth")
+        assert profile is not None
+        self.assertIs(profile.supports_streaming, True)
+
+        # Exercise Hermes' actual dispatch decision, not just the profile flag:
+        # external-process providers otherwise remain non-streaming by default.
+        from agent.turn_api_call import _should_stream
+
+        agent = SimpleNamespace(
+            provider=profile.name,
+            base_url=profile.base_url,
+            _disable_streaming=False,
+            _has_stream_consumers=lambda: True,
+            client=None,
+        )
+        self.assertTrue(_should_stream(agent))
 
     def test_alias_lookup(self):
         profile = get_provider_profile("google-antigravity")
@@ -556,6 +583,163 @@ class AntigravityPluginTests(unittest.TestCase):
             # Usage chunk
             self.assertEqual(chunks[3].choices, [])
             self.assertEqual(chunks[3].usage.total_tokens, 55)
+
+    def test_stdout_reader_applies_backpressure_when_consumer_pauses(self):
+        class FastStdout:
+            def __init__(self, line_count):
+                self.line_count = line_count
+                self.calls = 0
+
+            def readline(self):
+                self.calls += 1
+                if self.calls > self.line_count:
+                    return ""
+                return f"line-{self.calls}\n"
+
+        total_lines = 10_000
+        stdout = FastStdout(total_lines)
+        reader = _StdoutLineReader(stdout)
+        try:
+            self.assertGreater(reader._lines.maxsize, 0, "stdout queue must be bounded")
+            deadline = time.monotonic() + 1.0
+            while reader._lines.qsize() < reader._lines.maxsize and time.monotonic() < deadline:
+                time.sleep(0.001)
+            self.assertEqual(reader._lines.qsize(), reader._lines.maxsize)
+            calls_at_capacity = stdout.calls
+            time.sleep(0.05)
+            self.assertLessEqual(stdout.calls, calls_at_capacity + 1)
+            self.assertLess(stdout.calls, total_lines)
+        finally:
+            while True:
+                try:
+                    line = reader.readline(timeout=0.5)
+                except TimeoutError:
+                    break
+                if not line:
+                    break
+
+    def test_stream_close_unblocks_stdout_reader_waiting_for_queue_space(self):
+        class FloodingStdout:
+            def __init__(self):
+                self.release = threading.Event()
+
+            def readline(self):
+                return "" if self.release.is_set() else "line\n"
+
+        stdout = FloodingStdout()
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        client = AntigravityClient(cwd=tmp_dir.name)
+        proc = MagicMock()
+        proc.stdout = stdout
+        proc.poll.return_value = None
+        proc.wait.return_value = 0
+        client._active_processes.add(proc)
+        stream = AntigravityStream(proc=cast(subprocess.Popen, proc), client=client, model="test", timeout=1.0)
+        reader = _stdout_line_reader(proc)
+        assert reader is not None
+        try:
+            deadline = time.monotonic() + 1.0
+            while reader._lines.qsize() < reader._lines.maxsize and time.monotonic() < deadline:
+                time.sleep(0.001)
+            self.assertGreater(reader._lines.maxsize, 0, "stdout queue must be bounded")
+            self.assertEqual(reader._lines.qsize(), reader._lines.maxsize)
+            with patch("client.terminate_process", side_effect=lambda _proc: stdout.release.set()):
+                stream.close()
+            reader._thread.join(0.5)
+            self.assertFalse(reader._thread.is_alive(), "stdout reader stayed blocked after stream close")
+        finally:
+            stdout.release.set()
+            stream.close()
+            client.close()
+            deadline = time.monotonic() + 1.0
+            while reader._thread.is_alive() and time.monotonic() < deadline:
+                try:
+                    reader.readline(timeout=0.05)
+                except TimeoutError:
+                    pass
+                reader._thread.join(0.01)
+
+    def test_silent_stdout_read_respects_stream_deadline(self):
+        # A pipe.readline() that waits for a newline must not hold the
+        # provider turn past its configured deadline.
+        class BlockingStdout:
+            def __init__(self):
+                self.entered = threading.Event()
+                self.release = threading.Event()
+
+            def readline(self):
+                self.entered.set()
+                self.release.wait()
+                return ""
+
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        client = AntigravityClient(cwd=tmp_dir.name)
+        proc = self._scripted_proc([], alive=True)
+        stdout = BlockingStdout()
+        proc.stdout = stdout
+        proc.terminate.side_effect = stdout.release.set
+
+        with self._stubbed_kill_path():
+            with patch("subprocess.Popen", return_value=proc):
+                stream = client.chat.completions.create(
+                    model="gemini-3.8-flash-high",
+                    messages=[{"role": "user", "content": "hello"}],
+                    stream=True,
+                    timeout=0.2,
+                )
+
+            outcome = {}
+
+            def consume():
+                try:
+                    list(stream)
+                except Exception as exc:
+                    outcome["error"] = exc
+
+            consumer = threading.Thread(target=consume, daemon=True)
+            try:
+                consumer.start()
+                self.assertTrue(stdout.entered.wait(1.0))
+                consumer.join(1.0)
+                self.assertFalse(consumer.is_alive(), "stream stayed blocked in stdout.readline()")
+                error = outcome.get("error")
+                self.assertIsInstance(error, TimeoutError)
+                self.assertIn("timed out", str(error).lower())
+                proc.terminate.assert_called()
+            finally:
+                stdout.release.set()
+                if consumer.is_alive():
+                    consumer.join(1.0)
+                stream.close()
+                client.close()
+
+    def test_structured_host_timeout_uses_read_budget(self):
+        # Hermes passes httpx.Timeout objects; honor their read budget rather
+        # than silently replacing it with the plugin's shorter default.
+        cases = (
+            (SimpleNamespace(read=900.0), 900.0),
+            (SimpleNamespace(read=None), float("inf")),
+        )
+        for host_timeout, expected_timeout in cases:
+            with self.subTest(expected_timeout=expected_timeout):
+                tmp_dir = tempfile.TemporaryDirectory()
+                self.addCleanup(tmp_dir.cleanup)
+                client = AntigravityClient(cwd=tmp_dir.name)
+                proc = self._scripted_proc([], alive=True)
+
+                with self._stubbed_kill_path():
+                    with patch("subprocess.Popen", return_value=proc):
+                        stream = client.chat.completions.create(
+                            model="gemini-3.8-flash-high",
+                            messages=[{"role": "user", "content": "hello"}],
+                            stream=True,
+                            timeout=host_timeout,
+                        )
+                        self.assertEqual(stream.timeout, expected_timeout)
+                        stream.close()
+                    client.close()
 
     def test_mock_stream_tool_call(self):
         # TemporaryDirectory (not /tmp): on Windows "/tmp" resolves to a

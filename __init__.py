@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import subprocess
+from dataclasses import fields
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
@@ -30,6 +31,14 @@ _FALLBACK_MODELS = (
     "claude-sonnet-4-6",
     "claude-opus-4-6-thinking",
     "gpt-oss-120b-medium",
+)
+
+# External-process providers are deliberately non-streaming by default. Opt in
+# only on Hermes versions that expose the capability, preserving older hosts.
+_STREAMING_OPT_IN: dict[str, Any] = (
+    {"supports_streaming": True}
+    if "supports_streaming" in {field.name for field in fields(ProviderProfile)}
+    else {}
 )
 
 
@@ -315,6 +324,7 @@ antigravity_profile = AntigravityOAuthProfile(
     default_aux_model="gemini-3.8-flash",
     fallback_models=_FALLBACK_MODELS,
     supports_vision=False,
+    **_STREAMING_OPT_IN,
     classify_api_error=_classify_antigravity_error,
     auth_handler=antigravity_auth_handler,
 )

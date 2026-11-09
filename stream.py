@@ -7,6 +7,7 @@ import contextlib
 import io
 import json
 import logging
+import queue
 import subprocess
 import threading
 import time
@@ -15,6 +16,8 @@ from types import SimpleNamespace
 from typing import Any, Iterator, NamedTuple
 
 _STDERR_TAIL_CHARS = 4000
+_STDOUT_LINE_QUEUE_MAXSIZE = 64
+_STDOUT_QUEUE_POLL_SECONDS = 0.05
 
 
 class _StderrTail:
@@ -57,6 +60,120 @@ class _StderrTail:
             self._thread.join(timeout=0.5)
         with self._lock:
             return "".join(self._parts)[-_STDERR_TAIL_CHARS:].strip()
+
+
+class _StdoutLineReader:
+    """Read a child pipe in the background so consumers can enforce deadlines.
+
+    ``TextIO.readline()`` blocks until a newline or EOF and cannot be interrupted
+    by the stream's timeout check. Keep one reader on the process object because
+    worker processes survive across turns; the consumer waits on the queue with
+    its own per-turn deadline. This also works on Windows, where pipes are not
+    selectable with ``select``.
+    """
+
+    _EOF = object()
+
+    def __init__(self, stream: Any):
+        self._stream = stream
+        self._lines: queue.Queue[Any] = queue.Queue(maxsize=_STDOUT_LINE_QUEUE_MAXSIZE)
+        self._eof = False
+        self._closed = threading.Event()
+        self._thread = threading.Thread(
+            target=self._read_lines,
+            name="agy-stdout-reader",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _enqueue(self, item: Any) -> bool:
+        while True:
+            if self._closed.is_set():
+                try:
+                    self._lines.put_nowait(item)
+                    return True
+                except queue.Full:
+                    return False
+            try:
+                self._lines.put(item, timeout=_STDOUT_QUEUE_POLL_SECONDS)
+                return True
+            except queue.Full:
+                continue
+
+    def _read_lines(self) -> None:
+        while not self._closed.is_set():
+            try:
+                line = self._stream.readline()
+            except Exception as exc:
+                self._enqueue(exc)
+                return
+            if not isinstance(line, str):
+                self._enqueue(TypeError("agy stdout readline() returned non-text data"))
+                return
+            if not line:
+                self._enqueue(self._EOF)
+                return
+            if not self._enqueue(line):
+                return
+
+    def close(self) -> None:
+        self._closed.set()
+
+    def readline(self, timeout: float) -> str:
+        if self._eof:
+            return ""
+        deadline = None if timeout == float("inf") else time.monotonic() + max(0.0, timeout)
+        while True:
+            try:
+                item = self._lines.get_nowait()
+                break
+            except queue.Empty:
+                if self._closed.is_set():
+                    return ""
+                if deadline is None:
+                    wait = _STDOUT_QUEUE_POLL_SECONDS
+                else:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError
+                    wait = min(remaining, _STDOUT_QUEUE_POLL_SECONDS)
+            try:
+                item = self._lines.get(timeout=wait)
+                break
+            except queue.Empty as exc:
+                if self._closed.is_set():
+                    return ""
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError from exc
+        if item is self._EOF:
+            self._eof = True
+            return ""
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+
+def _stdout_line_reader(proc: Any) -> _StdoutLineReader | None:
+    """Return the process-persistent stdout reader, if the pipe is available."""
+    stream = getattr(proc, "stdout", None)
+    if stream is None:
+        return None
+    reader = getattr(proc, "_hermes_agy_stdout_reader", None)
+    if not isinstance(reader, _StdoutLineReader):
+        reader = _StdoutLineReader(stream)
+        try:
+            setattr(proc, "_hermes_agy_stdout_reader", reader)
+        except (AttributeError, TypeError):
+            pass
+    return reader
+
+
+def _close_stdout_line_reader(proc: Any) -> None:
+    """Stop a process's background reader before terminating its pipe."""
+    reader = getattr(proc, "_hermes_agy_stdout_reader", None)
+    if isinstance(reader, _StdoutLineReader):
+        reader.close()
+
 
 try:
     from .process import _check_early_quota_error
@@ -584,11 +701,25 @@ class AntigravityStream(Iterator[Any]):
             watchdog_thread.start()
 
         try:
+            stdout_reader = _stdout_line_reader(self.proc)
+            timeout_message = f"Antigravity stream timed out after {self.timeout:g} seconds"
+            timed_out = False
             while time.monotonic() < deadline:
                 if self._early_error:
                     raise RuntimeError(f"Antigravity model error: {self._early_error}")
 
-                line = self.proc.stdout.readline() if self.proc.stdout else ""
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    break
+                try:
+                    line = stdout_reader.readline(remaining) if stdout_reader else ""
+                except TimeoutError as exc:
+                    if self._early_error:
+                        raise RuntimeError(f"Antigravity model error: {self._early_error}") from exc
+                    if self.proc.poll() is not None:
+                        break
+                    raise TimeoutError(timeout_message) from exc
                 if self._early_error:
                     raise RuntimeError(f"Antigravity model error: {self._early_error}")
 
@@ -743,6 +874,11 @@ class AntigravityStream(Iterator[Any]):
                         and bool(has_content or has_tool_calls or text_buffer or final_resp)
                     )
                     break
+
+            if timed_out and not saw_result and self.proc.poll() is None:
+                if self._early_error:
+                    raise RuntimeError(f"Antigravity model error: {self._early_error}")
+                raise TimeoutError(timeout_message)
 
             if text_buffer and not has_tool_calls:
                 if self.has_tools or "<tool_call>" in text_buffer:

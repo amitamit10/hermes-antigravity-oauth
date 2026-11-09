@@ -77,9 +77,20 @@ def fetch_usage_report() -> UsageReport | None:
     return UsageReport(windows=tuple(windows), raw=body)
 
 
+_AGY_VERSION_CACHE: dict[str, tuple[int, int, int] | None] = {}
+
+
 def agy_supports_print_usage(agy: str, deadline: float) -> bool:
+    # Bypass cache if test env overrides version
+    is_test = "FAKE_AGY_VERSION" in os.environ or "FAKE_AGY_MODE" in os.environ
+    if not is_test and agy in _AGY_VERSION_CACHE:
+        version = _AGY_VERSION_CACHE[agy]
+        return version is not None and version >= MIN_AGY_VERSION
+
     stdout = run_agy(agy, ("--version",), min(deadline, time.monotonic() + VERSION_TIMEOUT_S))
     version = parse_agy_version(stdout or "")
+    if not is_test and version is not None:
+        _AGY_VERSION_CACHE[agy] = version
     return version is not None and version >= MIN_AGY_VERSION
 
 

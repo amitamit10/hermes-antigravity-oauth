@@ -520,6 +520,9 @@ class AntigravityClient:
                 cmd_args.extend(["--model", model])
             if effort:
                 cmd_args.extend(["--effort", effort])
+            for img_dir in ("/opt/data/images", os.path.expanduser("~/.hermes/images"), "/tmp/hermes_images"):
+                if os.path.isdir(img_dir):
+                    cmd_args.extend(["--add-dir", img_dir])
 
             proc = subprocess.Popen(
                 cmd_args,
@@ -562,6 +565,9 @@ class AntigravityClient:
             cmd_args.extend(["--model", model])
         if effort:
             cmd_args.extend(["--effort", effort])
+        for img_dir in ("/opt/data/images", os.path.expanduser("~/.hermes/images"), "/tmp/hermes_images"):
+            if os.path.isdir(img_dir):
+                cmd_args.extend(["--add-dir", img_dir])
 
         proc = subprocess.Popen(
             cmd_args,

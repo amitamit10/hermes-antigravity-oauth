@@ -323,7 +323,7 @@ antigravity_profile = AntigravityOAuthProfile(
     process_args_env_var="ANTIGRAVITY_ARGS",
     default_aux_model="gemini-3.8-flash",
     fallback_models=_FALLBACK_MODELS,
-    supports_vision=False,
+    supports_vision=True,
     **_STREAMING_OPT_IN,
     classify_api_error=_classify_antigravity_error,
     auth_handler=antigravity_auth_handler,

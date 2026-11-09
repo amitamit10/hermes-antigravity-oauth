@@ -78,17 +78,17 @@ def _patch(p: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _write_file(p: dict[str, Any]) -> dict[str, Any] | None:
-    path = _pick(p, "TargetFile", "path", "AbsolutePath")
-    content = _pick(p, "CodeContent", "content", "Content")
+    path = _pick(p, "TargetFile", "path", "AbsolutePath", "Path", "file_path", "FilePath")
+    content = _pick(p, "CodeContent", "content", "Content", "code", "Code")
     return {"path": str(path), "content": str(content)} if path and content is not None else None
 
 
 def _search_content(p: dict[str, Any]) -> dict[str, Any] | None:
-    pattern = _pick(p, "Query", "pattern", "SearchPattern")
+    pattern = _pick(p, "Query", "pattern", "SearchPattern", "Pattern")
     if not pattern:
         return None
     out: dict[str, Any] = {"pattern": str(pattern), "target": "content"}
-    if path := _pick(p, "SearchPath", "path", "Directory"):
+    if path := _pick(p, "SearchPath", "path", "Directory", "directory"):
         out["path"] = str(path)
     return out
 

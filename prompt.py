@@ -33,6 +33,75 @@ _TOOL_CALL_PREFIXES = tuple(
 )
 
 
+def _render_image_item(item: dict[str, Any]) -> str:
+    """Extract local image path or cache data URI / URL for agy image reference."""
+    url = ""
+    img_val = item.get("image_url")
+    if isinstance(img_val, dict):
+        url = str(img_val.get("url") or "")
+    elif isinstance(img_val, str):
+        url = img_val
+    elif "image" in item:
+        url = str(item.get("image") or "")
+    elif "url" in item:
+        url = str(item.get("url") or "")
+
+    url = url.strip()
+    if not url:
+        return ""
+
+    if url.startswith("file://"):
+        url = url[7:]
+
+    if url.startswith("data:image/") and ";base64," in url:
+        try:
+            import base64
+            import hashlib
+            from pathlib import Path
+
+            header, b64_data = url.split(";base64,", 1)
+            ext = "png"
+            if "image/" in header:
+                mime_sub = header.split("image/", 1)[1].split(";", 1)[0]
+                if mime_sub in ("jpeg", "jpg"):
+                    ext = "jpg"
+                elif mime_sub in ("gif", "webp"):
+                    ext = mime_sub
+            img_bytes = base64.b64decode(b64_data)
+            h = hashlib.sha256(img_bytes).hexdigest()[:16]
+            cache_dir = Path("/tmp/hermes_images")
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            img_file = cache_dir / f"img_{h}.{ext}"
+            if not img_file.exists():
+                img_file.write_bytes(img_bytes)
+            url = str(img_file)
+        except Exception:
+            pass
+    elif url.startswith(("http://", "https://")):
+        try:
+            import hashlib
+            import urllib.request
+            from pathlib import Path
+
+            h = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
+            raw_path = url.split("?")[0]
+            ext = raw_path.split(".")[-1].lower() if "." in raw_path else "png"
+            if ext not in ("png", "jpg", "jpeg", "webp", "gif"):
+                ext = "png"
+            cache_dir = Path("/tmp/hermes_images")
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            img_file = cache_dir / f"web_{h}.{ext}"
+            if not img_file.exists():
+                req = urllib.request.Request(url, headers={"User-Agent": "Hermes/1.0"})
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    img_file.write_bytes(resp.read())
+            url = str(img_file)
+        except Exception:
+            pass
+
+    return f"[Attached image: @{url}]"
+
+
 def _render_message_content(content: Any) -> str:
     """Normalize multimodal or structured message content into a string."""
     if content is None:
@@ -49,8 +118,10 @@ def _render_message_content(content: Any) -> str:
             elif isinstance(item, dict):
                 if item.get("type") == "text":
                     parts.append(str(item.get("text") or "").strip())
-                elif item.get("type") == "image_url" or "image_url" in item:
-                    parts.append("[image omitted: antigravity-oauth does not support multimodal image inputs]")
+                elif item.get("type") in ("image_url", "image") or "image_url" in item:
+                    img_tag = _render_image_item(item)
+                    if img_tag:
+                        parts.append(img_tag)
                 elif "content" in item:
                     parts.append(str(item.get("content") or "").strip())
         return "\n".join(p for p in parts if p).strip()
@@ -257,7 +328,13 @@ def _format_delta_prompt(new_messages: Sequence[dict[str, Any]]) -> str:
             parts.append(f"{label}:\n{rendered_content}")
 
     if last_role == "tool":
-        parts.append("Continue the conversation from the latest tool result.")
+        parts.append(
+            "Continue the conversation from the latest tool result. "
+            "Evaluate the latest tool result above and continue the task. "
+            "If more tools are needed, emit <tool_call> tags. "
+            "If you have enough information to fulfill the user's request, provide your clear response. "
+            "Do NOT return an empty response."
+        )
     elif last_role == "user":
         parts.append(
             "Respond directly and specifically to the latest user request above. "

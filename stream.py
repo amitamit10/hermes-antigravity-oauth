@@ -843,8 +843,10 @@ class AntigravityStream(Iterator[Any]):
                     # Fold a response that never streamed as deltas into the
                     # buffer so the post-loop flush emits it as content.
                     final_resp = res.get("response", "")
-                    if final_resp and not has_content and not has_tool_calls and not text_buffer:
-                        text_buffer = final_resp
+                    self._last_response = final_resp
+                    if final_resp and not has_content and not has_tool_calls:
+                        if not text_buffer.strip():
+                            text_buffer = final_resp
                     # POSITIVE success evidence only: status SUCCESS *and* an
                     # answer that actually exists (streamed content, tool
                     # calls, buffered text, or a response field) *and* no
@@ -1199,6 +1201,11 @@ def collect_stream_completion(stream: AntigravityStream) -> Any:
             tool_calls = extracted_calls
             full_content = cleaned or None
             finish_reason = "tool_calls"
+
+    if not tool_calls and not full_content:
+        last_resp = getattr(stream, "_last_response", "")
+        if last_resp and last_resp.strip():
+            full_content = last_resp.strip()
 
     message = SimpleNamespace(
         role="assistant",

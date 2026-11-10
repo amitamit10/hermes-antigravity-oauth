@@ -292,6 +292,52 @@ class _AwaitableCompletion(SimpleNamespace):
         return _ready(self).__await__()
 
 
+
+def _split_thought_and_content(text: str, in_thought: bool = False) -> tuple[list[tuple[str, str]], bool]:
+    chunks: list[tuple[str, str]] = []
+    while text:
+        if in_thought:
+            end_t = text.find("</thought>")
+            end_k = text.find("</thinking>")
+            tag_len = 0
+            idx = -1
+            if end_t != -1 and (end_k == -1 or end_t < end_k):
+                idx = end_t
+                tag_len = len("</thought>")
+            elif end_k != -1:
+                idx = end_k
+                tag_len = len("</thinking>")
+            if idx != -1:
+                thought_part = text[:idx]
+                if thought_part:
+                    chunks.append(("thought", thought_part))
+                text = text[idx + tag_len:]
+                in_thought = False
+            else:
+                chunks.append(("thought", text))
+                text = ""
+        else:
+            start_t = text.find("<thought>")
+            start_k = text.find("<thinking>")
+            tag_len = 0
+            idx = -1
+            if start_t != -1 and (start_k == -1 or start_t < start_k):
+                idx = start_t
+                tag_len = len("<thought>")
+            elif start_k != -1:
+                idx = start_k
+                tag_len = len("<thinking>")
+            if idx != -1:
+                content_part = text[:idx]
+                if content_part:
+                    chunks.append(("content", content_part))
+                text = text[idx + tag_len:]
+                in_thought = True
+            else:
+                chunks.append(("content", text))
+                text = ""
+    return chunks, in_thought
+
 class AntigravityStream(Iterator[Any]):
     """Streaming iterator yielding OpenAI ChatCompletionChunk objects from CLI stream-json."""
 
@@ -574,13 +620,14 @@ class AntigravityStream(Iterator[Any]):
         content: str | None = None,
         tool_calls: list[Any] | None = None,
         finish_reason: str | None = None,
+        reasoning_content: str | None = None,
     ) -> Any:
         delta = SimpleNamespace(
             role="assistant",
             content=content,
             tool_calls=tool_calls,
-            reasoning=None,
-            reasoning_content=None,
+            reasoning=reasoning_content,
+            reasoning_content=reasoning_content,
         )
         choice = SimpleNamespace(
             index=0,
@@ -664,6 +711,7 @@ class AntigravityStream(Iterator[Any]):
         has_tool_calls = False
         has_content = False
         in_tool_call = False
+        in_thought = False
         error_msg = ""
         status = ""
         # Positive evidence about how the stream ended: did a `result`
@@ -781,13 +829,28 @@ class AntigravityStream(Iterator[Any]):
                     if "usage" in step:
                         usage_data = step["usage"]
 
+                    thought_delta = (
+                        step.get("thinking_delta")
+                        or step.get("thought")
+                        or step.get("thought_delta")
+                        or step.get("reasoning_content")
+                        or step.get("reasoning")
+                    )
+                    if thought_delta:
+                        yield self._make_chunk(reasoning_content=str(thought_delta))
+
                     text_delta = step.get("text_delta")
                     if text_delta:
-                        if not self.has_tools:
-                            has_content = True
-                            yield self._make_chunk(content=text_delta)
-                        else:
-                            text_buffer += text_delta
+                        segments, in_thought = _split_thought_and_content(text_delta, in_thought)
+                        for kind, segment in segments:
+                            if kind == "thought":
+                                yield self._make_chunk(reasoning_content=segment)
+                            elif kind == "content":
+                                if not self.has_tools:
+                                    has_content = True
+                                    yield self._make_chunk(content=segment)
+                                else:
+                                    text_buffer += segment
                             while text_buffer:
                                 if in_tool_call:
                                     end_idx = text_buffer.find("</tool_call>")

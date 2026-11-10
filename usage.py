@@ -271,8 +271,13 @@ def _group_label(name: Any) -> str:
 def _parse_reset(value: Any) -> datetime | None:
     if not isinstance(value, str) or not value:
         return None
+    val = value.strip()
+    if val.endswith(("Z", "z")):
+        val = val[:-1] + "+00:00"
+    import re
+    val = re.sub(r"(\.\d{6})\d+", r"\1", val)
     try:
-        parsed = datetime.fromisoformat(value)
+        parsed = datetime.fromisoformat(val)
     except ValueError:
         return None
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)

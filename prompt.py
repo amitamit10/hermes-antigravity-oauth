@@ -99,7 +99,72 @@ def _render_image_item(item: dict[str, Any]) -> str:
         except Exception:
             pass
 
-    return f"[Attached image: @{url}]"
+    return f"[Attached image: @{url}] (Inspect the image visual pixels directly without calling file inspection tools)"
+
+
+
+def _render_file_item(item: dict[str, Any]) -> str:
+    """Extract document/file path or cache data URI / URL for agy file reference."""
+    url = ""
+    for k in ("file_path", "path", "file_url", "url", "file", "document"):
+        if k in item and item[k]:
+            v = item[k]
+            if isinstance(v, dict) and "url" in v:
+                url = str(v["url"] or "")
+            elif isinstance(v, str):
+                url = v
+            if url:
+                break
+    url = url.strip()
+    if not url:
+        return ""
+    if url.startswith("file://"):
+        url = url[7:]
+    from pathlib import Path
+    try:
+        p = Path(url)
+        if p.exists() and p.is_file():
+            return f"[Attached file: @{url}]"
+    except Exception:
+        pass
+    if url.startswith("data:") and ";base64," in url:
+        try:
+            import base64
+            import hashlib
+            header, b64_data = url.split(";base64,", 1)
+            ext = "bin"
+            if "/" in header:
+                mime_sub = header.split("/", 1)[1].split(";", 1)[0]
+                if mime_sub in ("pdf", "txt", "csv", "json", "md", "html"):
+                    ext = mime_sub
+            doc_bytes = base64.b64decode(b64_data)
+            h = hashlib.sha256(doc_bytes).hexdigest()[:16]
+            cache_dir = Path("/tmp/hermes_docs")
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            doc_file = cache_dir / f"doc_{h}.{ext}"
+            if not doc_file.exists():
+                doc_file.write_bytes(doc_bytes)
+            return f"[Attached file: @{doc_file}]"
+        except Exception:
+            pass
+    elif url.startswith(("http://", "https://")):
+        try:
+            import hashlib
+            import urllib.request
+            h = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
+            raw_path = url.split("?")[0]
+            ext = raw_path.split(".")[-1].lower() if "." in raw_path else "pdf"
+            cache_dir = Path("/tmp/hermes_docs")
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            doc_file = cache_dir / f"doc_{h}.{ext}"
+            if not doc_file.exists():
+                req = urllib.request.Request(url, headers={"User-Agent": "Hermes/1.0"})
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    doc_file.write_bytes(resp.read())
+            return f"[Attached file: @{doc_file}]"
+        except Exception:
+            pass
+    return f"[Attached file: @{url}]"
 
 
 def _render_message_content(content: Any) -> str:
@@ -122,6 +187,10 @@ def _render_message_content(content: Any) -> str:
                     img_tag = _render_image_item(item)
                     if img_tag:
                         parts.append(img_tag)
+                elif item.get("type") in ("document", "file", "attachment") or any(k in item for k in ("file_path", "file_url", "document")):
+                    doc_tag = _render_file_item(item)
+                    if doc_tag:
+                        parts.append(doc_tag)
                 elif "content" in item:
                     parts.append(str(item.get("content") or "").strip())
         return "\n".join(p for p in parts if p).strip()

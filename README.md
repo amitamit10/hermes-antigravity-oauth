@@ -1,98 +1,97 @@
 # hermes-antigravity-oauth
 
 [![npm](https://img.shields.io/npm/v/hermes-antigravity-oauth?logo=npm)](https://www.npmjs.com/package/hermes-antigravity-oauth)
-[![release](https://github.com/neerazz/hermes-antigravity-oauth/actions/workflows/release.yml/badge.svg)](https://github.com/neerazz/hermes-antigravity-oauth/actions/workflows/release.yml)
-[![provenance](https://img.shields.io/badge/npm-provenance-blue)](https://www.npmjs.com/package/hermes-antigravity-oauth#provenance)
-[![license](https://img.shields.io/github/license/neerazz/hermes-antigravity-oauth)](LICENSE)
+[![release](https://github.com/amitamit10/hermes-antigravity-oauth/actions/workflows/release.yml/badge.svg)](https://github.com/amitamit10/hermes-antigravity-oauth/actions/workflows/release.yml)
+[![license](https://img.shields.io/github/license/amitamit10/hermes-antigravity-oauth)](LICENSE)
 
 Run [Hermes Agent](https://hermes-agent.nousresearch.com) on your Google Antigravity plan (Gemini 3.x, Claude 4.6, GPT-OSS) with a single sign-in.
 
 ```bash
-npx hermes-antigravity-oauth          # install + enable the plugin, then sign in
-hermes --provider antigravity-oauth -m claude-sonnet-4-6
+hermes plugins install https://github.com/amitamit10/hermes-antigravity-oauth --enable
+hermes auth add antigravity-oauth
+hermes --provider antigravity-oauth -m gemini-3.8-flash-low
 ```
 
-## How it works
+## Key Features
 
-- **The calls are Antigravity CLI calls.** Every model request is made by Google's official `agy` binary, using agy's own login. The plugin sends no HTTP requests of its own and never imitates Google's OAuth client.
-- **Sign-in belongs to agy.** `hermes auth add antigravity-oauth` runs agy's browser OAuth flow and then confirms it live with `agy models`. Over SSH, paste the code back when asked. The token stays wherever agy stores it (OS keychain or agy's token file). The plugin never reads, copies, uploads, or writes it.
-- **What it does touch (disclosure):** each agy process runs in a private temp HOME. To let agy reuse its own login there, the plugin symlinks agy's `antigravity-oauth-token` file into that HOME, and on macOS it symlinks `~/Library/Keychains`. Before spawning, it checks the OS keyring for the credential's existence only (`security` / `secret-tool` / `cmdkey`) and never reads the secret. The temp HOME is deleted when the session closes.
-- **Your Hermes SOUL.md is the persona.** Each turn, the plugin writes Hermes' system prompt into agy's private workspace as `GEMINI.md`, which agy loads as first-class rules. That prompt starts with `$HERMES_HOME/SOUL.md`, and the file is added directly if Hermes left it out.
-- **Hermes runs the tools.** agy's built-in tools never execute on your host. When a model calls one anyway, the plugin re-issues it as the matching Hermes tool: `run_command`→`terminal`, `view_file`→`read_file`, `grep_search`/`find_by_name`→`search_files`, `write_to_file`→`write_file`, `search_web`→`web_search`, `read_url_content`→`web_extract`. It then runs under Hermes' approvals and sandbox. Any other native tool is blocked.
-- **`/usage` asks agy for your quota.** `/usage` and `hermes usage` run `agy --version` and then `agy -p /usage --output-format json`, which answers from agy's own session without a model turn. You get one row per quota group, such as `Gemini 7d` and `Claude/GPT 7d`. It only runs when agy is signed in, from a temp folder with your normal HOME and agy's auto-updater turned off.
+- **Official Google Antigravity CLI Integration**: Every request runs via the official `agy` CLI binary using your authorized Google account. The plugin never touches, copies, or uploads your OAuth token.
+- **Thinking Mode & Reasoning Separation**: Transparently parses model reasoning blocks (`<thought>...</thought>`, `<thinking>...</thinking>`) and structured thinking events into Hermes native `delta.reasoning_content` channel. Model reasoning stays in Hermes collapsible thinking UI and never leaks into user text or corrupts tool arguments.
+- **Multimodal Documents & Files**: First-class support for attached documents, files, images, and attachments (`type: "document"`, `type: "file"`, `type: "attachment"`, `file_path`, `file_url`). Files are cached safely and referenced as native `@path` markers in the models isolated workspace.
+- **Native Tool Bridging & Sandboxing**: Antigravity internal tools are safely intercepted and re-issued as native Hermes tools running under your configured sandbox and approval settings:
+  - `run_command` → `terminal`
+  - `view_file` → `read_file`
+  - `edit_file` → `patch`
+  - `grep_search` / `find_by_name` → `search_files`
+  - `write_to_file` → `write_file`
+  - `search_web` → `web_search`
+  - `read_url_content` → `web_extract`
+  - Any unmapped native tool is neutralized before host execution.
+- **SOUL & Persona Delivery**: Writes Hermes system prompt and persona (`$HERMES_HOME/SOUL.md`) into the per-session private workspace as `GEMINI.md`, which `agy` loads as first-class instructions.
+- **Quota & Usage Telemetry**: `/usage` and `hermes usage` query `agy` quota API directly with cross-platform Python 3.10–3.14 support for ISO 8601 reset timestamps (`Z` suffix and sub-microsecond precision).
+- **Headless / Remote Login Helper**: Includes `scripts/remote-login.py` for headless VPS and SSH servers where interactive browser access is unavailable.
 
-## Limitations
+## How It Works
 
-- `/usage` needs agy 1.1.11 or newer. On older versions it shows nothing.
-- On Windows, a hung `/usage` call is cleaned up through Hermes' process helper (Hermes 0.21.4 or newer, with psutil installed), which kills everything agy started. Without it, a process agy started can keep running in the background.
+- **Calls belong to agy**: Requests are dispatched to `agy` subprocesses in an isolated temp HOME.
+- **Keyring & Token Isolation**: The plugin symlinks the credential file (`antigravity-oauth-token`) or macOS keychain into the temp HOME and probes credential presence via OS keyring tools (`secret-tool`, `security`, `cmdkey`) without reading secrets. The workspace is cleaned up automatically on session exit.
+- **Process Supervision**: Cleanly unblocks streaming reader threads, enforces host timeout budgets, and prevents orphaned child processes.
 
 ## Install
 
-Requirements: Hermes Agent, plus the Antigravity CLI (`agy`) from <https://antigravity.google/cli>.
+Requirements: Hermes Agent (`>=0.21.0`), plus the Antigravity CLI (`agy`) from <https://antigravity.google/cli>.
 
 | Route | Command |
 |---|---|
-| npx (recommended) | `npx hermes-antigravity-oauth` (add `--yes` to install agy if it is missing) |
-| Hermes directly | `hermes plugins install https://github.com/neerazz/hermes-antigravity-oauth --enable` then `hermes auth add antigravity-oauth` |
+| Hermes CLI (recommended) | `hermes plugins install https://github.com/amitamit10/hermes-antigravity-oauth --enable` then `hermes auth add antigravity-oauth` |
+| npx installer | `npx hermes-antigravity-oauth` (add `--yes` to install agy if missing) |
 
-npx commands: `install` (default), `login`, `status`, `uninstall`. Flags: `--yes`, `--no-login`, `--force`, and a 40-hex commit SHA to pin the version.
-
-## Auth commands
+## Auth Commands
 
 | Command | Effect |
 |---|---|
-| `hermes auth add antigravity-oauth` | Runs agy's Google sign-in, then verifies it live |
+| `hermes auth add antigravity-oauth` | Runs agy Google sign-in flow and verifies live |
 | `hermes auth status antigravity-oauth` | Live check through `agy models` |
-| `hermes auth logout antigravity-oauth` | Explains agy's `/logout` (Hermes holds no token) |
+| `hermes auth logout antigravity-oauth` | Guides logout through `agy /logout` |
 
 Aliases: `google-antigravity`, `agy-oauth`.
 
-### Headless / remote login
+### Headless / Remote Login
 
-`agy` prints its Google OAuth URL and waits ~60 seconds for the code on its
-own TTY. When the approver is not at that terminal (SSH without a browser,
-a chat-driven host), relay the code through a file instead:
+When running Hermes on a remote server or VPS over SSH:
 
-```sh
-git clone https://github.com/neerazz/hermes-antigravity-oauth
+```bash
+git clone https://github.com/amitamit10/hermes-antigravity-oauth
 python3 hermes-antigravity-oauth/scripts/remote-login.py --code-file /tmp/agy-code.txt &
-# open the printed LOGIN_URL, approve, then:
-printf '%s' '<code>' > /tmp/agy-code.txt
-wait  # exits 0 once `agy models` confirms the session
+# Open the printed LOGIN_URL in your browser, authorize, then:
+printf "%s" "<authorization_code>" > /tmp/agy-code.txt
+wait
 ```
 
-The script drives agy under a PTY with only the standard library, feeds the
-code the moment it arrives (polling, not blocking on agy output — agy is
-silent during its wait, which is where naive wrappers starve), and verifies
-with `agy models`. Note: agy still allows ~60 seconds from URL to code, so
-the approver should open the URL promptly; without `--code-file` the code is
-read from stdin.
+The script manages the PTY interaction, feeds the code the moment it is written, and confirms session status with `agy models`.
 
 ## Configuration
 
-| Env var | Default | Purpose |
+| Environment Variable | Default | Purpose |
 |---|---|---|
-| `ANTIGRAVITY_COMMAND` | `agy` | Path to the agy binary |
-| `ANTIGRAVITY_WORKSPACE_RULES` | `1` | `0` puts SOUL/system prompt inline in the prompt instead of `GEMINI.md` |
+| `ANTIGRAVITY_COMMAND` | `agy` | Custom path to the `agy` binary |
+| `ANTIGRAVITY_WORKSPACE_RULES` | `1` | `1` writes `GEMINI.md` in workspace; `0` puts SOUL inline in the prompt |
 
-Claude and GPT-OSS models get no `--effort` flag because agy rejects it for them. Gemini models accept the `-low/-medium/-high` suffixes.
+Gemini models support effort suffixes (e.g. `-low`, `-medium`, `-high`). Claude and GPT-OSS models automatically omit unsupported effort flags.
 
-## Development
+## Testing & Validation
 
 ```bash
-PYTHONPATH=<hermes-agent checkout>:. python tests/test_auth_handler.py   # etc. for each tests/test_*.py
+# Run full unit test suite
+PYTHONPATH=<hermes-agent-src>:. python3 -m unittest discover -s tests -p "test_*.py"
+
+# Validate plugin manifest and compatibility
+hermes plugins validate . --json
 ```
-
-## Releases
-
-Every push to `main` runs `.github/workflows/release.yml`. It first runs the full test suite against Hermes Agent `main`. Then it publishes the next version to npm with provenance, using npm trusted publishing (GitHub OIDC), so the repo stores no npm token. Finally it tags the commit `vX.Y.Z`.
-
-- Default: patch bump from the latest published version.
-- Minor/major: set `version` in `package.json` above the published one in the commit, and that exact version is published.
-- A red test run publishes nothing.
 
 ## Credits
 
-The streaming client, process isolation, and keyring probes come from [soyelmismo/hermes-antigravity-subscription](https://github.com/soyelmismo/hermes-antigravity-subscription) (MIT) at `b7ab470`. This package adds the auth handler, SOUL delivery, native-tool bridging, and the npx installer.
+- Original streaming client, process isolation, and keyring probes: [soyelmismo/hermes-antigravity-subscription](https://github.com/soyelmismo/hermes-antigravity-subscription) (MIT).
+- Initial package structure and npx installer: [neerazz/hermes-antigravity-oauth](https://github.com/neerazz/hermes-antigravity-oauth) (MIT).
+- Maintained and extended by [amitamit10](https://github.com/amitamit10): thinking mode separation, multimodal document attachments, patch tool mapping, robust quota parsing, and headless login.
 
-MIT © Neeraj Kumar Singh Beshane
+MIT © 2026

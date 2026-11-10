@@ -462,7 +462,7 @@ class AsyncStreamSemanticsTests(_PinnedSeamsMixin, unittest.TestCase):
         deadline = time.monotonic() + timeout
         while threading.active_count() > baseline and time.monotonic() < deadline:
             time.sleep(0.01)
-        self.assertLessEqual(threading.active_count(), baseline)
+        self.assertEqual(threading.active_count(), baseline)
 
     def test_exhausted_worker_stream_retires_its_executor(self):
         # The worker SUCCESS path deliberately does not call close() (the
@@ -668,10 +668,11 @@ class AsyncStreamSemanticsTests(_PinnedSeamsMixin, unittest.TestCase):
         self.assertEqual(results[1].choices[0].finish_reason, "stop")
 
     def test_async_reads_run_on_a_private_thread_not_the_shared_executor(self):
-        # Executor-starvation fix (see __anext__): blocking pipe.readline()
-        # now runs on a process-persistent stdout-reader thread; async pulls
-        # still use this stream's private executor, never the host's shared
-        # default executor (which could be pinned for the whole 300s timeout).
+        # Executor-starvation fix (see __anext__): the blocking readline must
+        # occupy THIS stream's private single-thread executor, never a shared
+        # default-executor thread (which could be pinned for the whole 300s
+        # request timeout and starve every other run_in_executor(None, ...)
+        # user of the host loop).
         client = self._client()
         read_threads: list[str] = []
         read_thread_counts: list[int] = []
@@ -699,12 +700,8 @@ class AsyncStreamSemanticsTests(_PinnedSeamsMixin, unittest.TestCase):
             # the sync suite finalizes abandoned generators explicitly.
             stream.close()
         self.assertTrue(read_threads)
-        self.assertTrue(any(name == "agy-stdout-reader" for name in read_threads))
         for name in read_threads:
-            self.assertTrue(
-                name.startswith(("agy-stream", "agy-stdout-reader")),
-                f"read ran on {name!r}",
-            )
+            self.assertTrue(name.startswith("agy-stream"), f"read ran on {name!r}")
         self.assertFalse(
             any(name.startswith(("asyncio_", "ThreadPoolExecutor-")) for name in read_threads),
             "a shared default-executor thread performed the blocking read",

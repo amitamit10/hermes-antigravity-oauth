@@ -11,7 +11,6 @@ import logging
 import os
 import re
 import subprocess
-from dataclasses import fields
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
@@ -23,23 +22,52 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_FALLBACK_MODELS = (
-    "gemini-3.8-flash",
-    "gemini-3.7-flash",
-    "gemini-3.6-flash",
-    "gemini-3.1-pro",
-    "claude-sonnet-4-6",
-    "claude-opus-4-6-thinking",
-    "gpt-oss-120b-medium",
-)
+try:
+    from .models import _CLI_EFFORTS, _FALLBACK_MODELS, _normalize_effort, supports_effort_flag
+except ImportError:  # flat source tree under test
+    from models import _CLI_EFFORTS, _FALLBACK_MODELS, _normalize_effort, supports_effort_flag
 
-# External-process providers are deliberately non-streaming by default. Opt in
-# only on Hermes versions that expose the capability, preserving older hosts.
-_STREAMING_OPT_IN: dict[str, Any] = (
-    {"supports_streaming": True}
-    if "supports_streaming" in {field.name for field in fields(ProviderProfile)}
-    else {}
-)
+_MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]*")
+_TABLE_HEADERS = {"id", "model", "model id", "model_id"}
+_DIAGNOSTIC_IDS = {"error", "warning", "failed", "failure"}
+
+
+def _parse_model_table(output: str) -> list[str] | None:
+    """Validate agy's ID/name table; preserve IDs, order and case exactly.
+
+    None means invalid/incomplete discovery; [] is a successful empty output.
+    Progress or headers alone cannot establish a successful empty table.
+    """
+    models: list[str] = []
+    seen: set[str] = set()
+    metadata = False
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.lower().rstrip(".") == "fetching available models":
+            metadata = True
+            continue
+        fields = raw_line.split("\t")
+        model_id = fields[0]
+        if (
+            len(fields) == 2
+            and model_id.lower() in _TABLE_HEADERS
+            and fields[1].strip().lower() in {"name", "model name", "display name"}
+        ):
+            metadata = True
+            continue
+        if (
+            len(fields) != 2
+            or not fields[1].strip()
+            or not _MODEL_ID.fullmatch(model_id)
+            or model_id.lower().rstrip(":") in _DIAGNOSTIC_IDS | _TABLE_HEADERS
+        ):
+            return None
+        if model_id not in seen:
+            seen.add(model_id)
+            models.append(model_id)
+    return None if metadata and not models else models
 
 
 class AntigravityOAuthProfile(ProviderProfile):
@@ -62,21 +90,8 @@ class AntigravityOAuthProfile(ProviderProfile):
     def supported_reasoning_efforts(
         self, model: str | None
     ) -> tuple[str, ...] | None:
-        """Declared reasoning-effort vocabulary for models on this provider.
-        
-        Enables Hermes /model picker and /reasoning commands to offer appropriate
-        thinking effort options (low, medium, high) for reasoning-capable models.
-        """
-        m = (model or "").lower()
-        if "gemini-3.1-pro" in m:
-            return ("low", "high")
-        if "gemini" in m or "flash" in m or "pro" in m:
-            return ("low", "medium", "high")
-        if "claude" in m:
-            return ("low", "medium", "high")
-        if "gpt" in m:
-            return ()
-        return ("low", "medium", "high")
+        """Native variants own their effort; only suffixless Gemini accepts a flag."""
+        return _CLI_EFFORTS if supports_effort_flag(model) else ()
 
     def build_api_kwargs_extras(
         self,
@@ -85,16 +100,27 @@ class AntigravityOAuthProfile(ProviderProfile):
         model: str | None = None,
         **context: Any,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Extract reasoning effort and forward as top-level api_kwargs to AntigravityClient."""
+        """Project the session for live reasoning; forward effort only when agy accepts it.
+
+        The separate CLI effort flag is valid only for manual suffixless Gemini
+        requests. The session projection is independent of the model.
+        """
+        top_level: dict[str, Any] = {}
+        session_id = context.get("session_id")
+        if isinstance(session_id, str) and session_id:
+            from .live_reasoning import ensure_registered
+            ensure_registered()
+            top_level["_agy_session_id"] = session_id
+        if not supports_effort_flag(model):
+            return {}, top_level
         effort = None
         if isinstance(reasoning_config, dict):
             if reasoning_config.get("enabled") is False:
                 effort = "low"
             else:
-                effort = reasoning_config.get("effort")
-        top_level: dict[str, Any] = {}
+                effort = _normalize_effort(reasoning_config.get("effort"))
         if effort:
-            top_level["reasoning_effort"] = str(effort).strip().lower()
+            top_level["reasoning_effort"] = effort
         return {}, top_level
 
     def fetch_models(
@@ -103,26 +129,12 @@ class AntigravityOAuthProfile(ProviderProfile):
         api_key: str | None = None,
         base_url: str | None = None,
         timeout: float = 15.0,
-        use_cache: bool = True,
     ) -> list[str] | None:
-        """Query `agy models` and normalize to clean, deduplicated base models.
+        """Return only exact IDs from a successful live `agy models` table.
 
-        Separates model families from thinking efforts (e.g. `gemini-3.8-flash-{low,medium,high}`
-        becomes `gemini-3.8-flash`), allowing Hermes' native reasoning effort picker to handle
-        the thinking depth cleanly.
-
-        `agy models` hits the network on every call (~2s), and Hermes calls
-        this on every provider/model switch, so a fresh file cache (TTL 1h,
-        see models.models_cache_ttl) is returned without spawning agy. A
-        stale cache is still preferred over the hardcoded fallback when the
-        live call fails.
+        None means failed discovery; [] means successful empty discovery.
+        No static catalog or plugin-owned cache is used.
         """
-        try:
-            from .models import clean_base_models, load_models_cache, models_cache_ttl, save_models_cache
-        except ImportError:
-            # Loaded outside a package (e.g. a flat source tree under test):
-            # the absolute name is the same module.
-            from models import clean_base_models, load_models_cache, models_cache_ttl, save_models_cache
         try:
             from .client import resolve_agy_command
         except ImportError:
@@ -130,44 +142,23 @@ class AntigravityOAuthProfile(ProviderProfile):
             # the absolute name is the same module.
             from client import resolve_agy_command
 
-        ttl = models_cache_ttl()
-        if use_cache and ttl > 0:
-            cached = load_models_cache(ttl)
-            if cached:
-                return cached
-        cmd = resolve_agy_command()
         try:
+            cmd = resolve_agy_command()
             res = subprocess.run(
                 [cmd, "models"],
                 capture_output=True,
                 text=True,
+                stdin=subprocess.DEVNULL,
                 timeout=timeout,
             )
-            raw_models: list[str] = []
-            for raw_line in res.stdout.strip().splitlines():
-                line = raw_line.strip()
-                if not line or "fetching" in line.lower():
-                    continue
-                parts = line.split()
-                if parts:
-                    model_id = parts[0]
-                    if any(c in model_id.lower() for c in ("gemini", "claude", "gpt", "model")):
-                        raw_models.append(model_id)
-
-            if raw_models:
-                clean_models = clean_base_models(raw_models)
-                if use_cache and ttl > 0:
-                    save_models_cache(clean_models)
-                return clean_models
+            if res.returncode != 0:
+                logger.debug("Antigravity model discovery exited %s", res.returncode)
+                return None
+            return _parse_model_table(res.stdout)
         except Exception as exc:
             logger.debug("Antigravity fetch_models failed: %s", exc)
 
-        if use_cache and ttl > 0:
-            stale = load_models_cache(None)
-            if stale:
-                logger.debug("Antigravity fetch_models: serving stale catalog cache")
-                return stale
-        return list(_FALLBACK_MODELS)
+        return None
 
     def fetch_account_usage(
         self, *, base_url: str | None = None, api_key: str | None = None
@@ -200,11 +191,10 @@ class AntigravityOAuthProfile(ProviderProfile):
         )
 
     def get_model_context_length(self, model: str) -> int | None:
-        """Declared context window for Antigravity CLI.
+        """Defer to Hermes-native metadata unless a positive override is set.
 
-        Reads limit.context from models_dev_cache.json when present (which reflects the
-        1M/200k specs of Gemini / Claude / GPT models). An id the catalog does not list
-        returns None, so Hermes keeps resolving instead of substituting one number.
+        This public hook declares no account-serving capacity of its own.
+        Unrecognized exact IDs may receive Hermes' generic unknown fallback.
         """
         env_val = os.environ.get("ANTIGRAVITY_CONTEXT_LENGTH")
         if env_val:
@@ -214,12 +204,7 @@ class AntigravityOAuthProfile(ProviderProfile):
                     return val
             except ValueError:
                 pass
-        try:
-            from .context_window import context_length_for
-        except ImportError:
-            from context_window import context_length_for
-
-        return context_length_for(model)
+        return None
 
     def classify_api_error(
         self,
@@ -271,35 +256,6 @@ def _classify_antigravity_error(
             "retryable": True,
             "should_compress": True,
         }
-    if any(
-        pattern in err_str
-        for pattern in (
-            "individual quota reached",
-            "quota exceeded",
-            "resource_exhausted",
-            "resource exhausted",
-            "eligibility check failed",
-            "not currently available in your location",
-            "account ineligible",
-        )
-    ):
-        return {
-            "reason": "rate_limit",
-            "retryable": True,
-            "should_fallback": True,
-        }
-    if any(
-        pattern in err_str
-        for pattern in (
-            "antigravity cli is not authenticated",
-            "oauth token expired",
-            "token has expired",
-        )
-    ):
-        return {
-            "reason": "auth_login_required",
-            "retryable": False,
-        }
     return None
 
 
@@ -321,12 +277,17 @@ antigravity_profile = AntigravityOAuthProfile(
     process_args=("--output-format", "stream-json", "--disable-slash-commands"),
     process_command_env_vars=("ANTIGRAVITY_COMMAND", "AGY_CLI_PATH", "ANTIGRAVITY_CLI_PATH"),
     process_args_env_var="ANTIGRAVITY_ARGS",
-    default_aux_model="gemini-3.8-flash",
+    default_aux_model="",
     fallback_models=_FALLBACK_MODELS,
     supports_vision=True,
-    **_STREAMING_OPT_IN,
     classify_api_error=_classify_antigravity_error,
     auth_handler=antigravity_auth_handler,
 )
 
 register_provider(antigravity_profile)
+
+
+def register(ctx):
+    """Optional general-plugin lifecycle entry point (provider discovery skips it)."""
+    from .live_reasoning import register as register_reasoning
+    return register_reasoning(ctx)

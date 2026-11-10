@@ -7,7 +7,6 @@ existing Antigravity / Gemini subscription quota.
 
 from __future__ import annotations
 
-import atexit
 import contextlib
 import json
 import logging
@@ -50,7 +49,8 @@ try:
         _parse_tool_block,
         _render_message_content,
     )
-    from .stream import AntigravityStream, collect_stream_completion, _close_stdout_line_reader
+    from .thinking import ThinkingReader
+    from .stream import AntigravityStream, collect_stream_completion
     from . import soul as _soul
 except ImportError:
     from models import (
@@ -80,7 +80,8 @@ except ImportError:
         _parse_tool_block,
         _render_message_content,
     )
-    from stream import AntigravityStream, collect_stream_completion, _close_stdout_line_reader
+    from thinking import ThinkingReader
+    from stream import AntigravityStream, collect_stream_completion
     import soul as _soul
 
 logger = logging.getLogger(__name__)
@@ -295,6 +296,7 @@ class AntigravityClient:
         # out of the locked region would trade the deadlock for races.
         self._lock = threading.RLock()
         self._worker_proc: subprocess.Popen | None = None
+        self._worker_conversation_id = ""
         self._worker_model: str | None = None
         self._worker_effort: str | None = None
         self._worker_history: list[dict[str, Any]] = []
@@ -307,9 +309,6 @@ class AntigravityClient:
         # session cannot corrupt a later session's baseline.
         self._worker_usage_baseline: dict[str, int] = {}
         self._worker_lock = threading.Lock()
-        # Register atexit handler so unhandled exits (e.g. oneshot mode or unclosed sessions)
-        # terminate any background agy worker and remove the temp directory cleanly (issue #4).
-        atexit.register(self.close)
 
     @staticmethod
     def _resolve_real_token_path() -> Path | None:
@@ -327,7 +326,6 @@ class AntigravityClient:
 
     @staticmethod
     def _terminate_process(proc: subprocess.Popen) -> None:
-        _close_stdout_line_reader(proc)
         terminate_process(proc)
 
     def __enter__(self) -> "AntigravityClient":
@@ -337,8 +335,6 @@ class AntigravityClient:
         self.close()
 
     def close(self) -> None:
-        with contextlib.suppress(Exception):
-            atexit.unregister(self.close)
         # Phase 1 -- terminate every child process BEFORE the workspace is
         # touched (issue #4): on Windows a still-running agy keeps
         # conversations/*.db open, and taskkill /F /T is asynchronous, so
@@ -357,6 +353,30 @@ class AntigravityClient:
         # failures. close() must never raise from cleanup and must never
         # leave the client half-closed (issue #4).
         self._remove_temp_dir()
+
+    def _sync_back_refreshed_token(self) -> None:
+        """If agy refreshed the OAuth token inside the isolated home, sync it back.
+
+        agy writes refreshed tokens atomically by replacing the file. That breaks the symlink
+        linking isolated_token to real_token, turning isolated_token into a regular file.
+        Before the workspace is deleted, sync the freshly refreshed token back to real_token
+        so subsequent requests and sessions keep the refreshed credentials.
+        """
+        try:
+            real_token = resolve_real_token_path()
+            if not real_token or not self._isolated_gemini_dir:
+                return
+            isolated_token = self._isolated_gemini_dir / real_token.name
+            if isolated_token.is_file() and not os.path.islink(isolated_token):
+                if isolated_token.stat().st_size > 10:
+                    shutil.copy2(isolated_token, real_token)
+                    logger.debug(
+                        "Synced refreshed OAuth token from %s back to %s",
+                        isolated_token,
+                        real_token,
+                    )
+        except Exception as exc:
+            logger.debug("Failed to sync back refreshed OAuth token: %s", exc)
 
     def _remove_temp_dir(self) -> None:
         """Remove the private workspace; cannot raise, cannot half-finish.
@@ -437,34 +457,11 @@ class AntigravityClient:
         if temp_dir.name:
             _force_rmtree(temp_dir.name)
 
-    def _sync_back_refreshed_token(self) -> None:
-        """If agy refreshed the OAuth token inside the isolated home, sync it back.
-
-        agy writes refreshed tokens atomically by replacing the file. That breaks the symlink
-        linking isolated_token to real_token, turning isolated_token into a regular file.
-        Before the workspace is deleted, sync the freshly refreshed token back to real_token
-        so subsequent requests and sessions keep the refreshed credentials.
-        """
-        try:
-            real_token = resolve_real_token_path()
-            if not real_token or not self._isolated_gemini_dir:
-                return
-            isolated_token = self._isolated_gemini_dir / real_token.name
-            if isolated_token.is_file() and not os.path.islink(isolated_token):
-                if isolated_token.stat().st_size > 10:
-                    shutil.copy2(isolated_token, real_token)
-                    logger.debug(
-                        "Synced refreshed OAuth token from %s back to %s",
-                        isolated_token,
-                        real_token,
-                    )
-        except Exception as exc:
-            logger.debug("Failed to sync back refreshed OAuth token: %s", exc)
-
     def _terminate_worker_locked(self) -> None:
         if self._worker_proc is not None:
             proc = self._worker_proc
             self._worker_proc = None
+            self._worker_conversation_id = ""
             self._worker_model = None
             self._worker_effort = None
             self._worker_history = []
@@ -520,9 +517,6 @@ class AntigravityClient:
                 cmd_args.extend(["--model", model])
             if effort:
                 cmd_args.extend(["--effort", effort])
-            for img_dir in ("/opt/data/images", os.path.expanduser("~/.hermes/images"), "/tmp/hermes_images"):
-                if os.path.isdir(img_dir):
-                    cmd_args.extend(["--add-dir", img_dir])
 
             proc = subprocess.Popen(
                 cmd_args,
@@ -538,6 +532,7 @@ class AntigravityClient:
                 **_own_process_group(),
             )
             self._worker_proc = proc
+            self._worker_conversation_id = ""
             self._worker_model = model
             self._worker_effort = effort
             self._worker_history = []
@@ -555,6 +550,7 @@ class AntigravityClient:
         tools: list[dict[str, Any]] | None,
         tool_choice: Any,
         stream: bool,
+        reasoning_emitter=None,
     ) -> Any:
         rules = self._sync_workspace_rules(messages)
         prompt_text = _format_messages_as_prompt(
@@ -565,9 +561,6 @@ class AntigravityClient:
             cmd_args.extend(["--model", model])
         if effort:
             cmd_args.extend(["--effort", effort])
-        for img_dir in ("/opt/data/images", os.path.expanduser("~/.hermes/images"), "/tmp/hermes_images"):
-            if os.path.isdir(img_dir):
-                cmd_args.extend(["--add-dir", img_dir])
 
         proc = subprocess.Popen(
             cmd_args,
@@ -583,6 +576,7 @@ class AntigravityClient:
             **_own_process_group(),
         )
 
+        thinking_reader = ThinkingReader.before_request(self._isolated_gemini_dir)
         try:
             if proc.stdin:
                 proc.stdin.write(prompt_text + "\n")
@@ -601,17 +595,18 @@ class AntigravityClient:
             timeout=timeout,
             tools=tools,
             is_worker=False,
+            thinking_reader=thinking_reader,
         )
         if stream:
             return stream_iter
-        return collect_stream_completion(stream_iter)
+        return collect_stream_completion(stream_iter, reasoning_emitter=reasoning_emitter)
 
     def _create_chat_completion(
         self,
         *,
         model: str | None = None,
         messages: list[dict[str, Any]] | None = None,
-        timeout: Any = None,
+        timeout: float | None = None,
         tools: list[dict[str, Any]] | None = None,
         tool_choice: Any = None,
         stream: bool = False,
@@ -630,12 +625,15 @@ class AntigravityClient:
         effort_param = reasoning_effort or extra_kwargs.get("reasoning_effort")
         resolved_model, effort = self._resolve_model_and_effort(model, effort_param)
         messages_list = list(messages or [])
-        # Hermes' streaming caller can pass an httpx.Timeout rather than a
-        # scalar. Use its read budget so long generations do not inherit the
-        # plugin's shorter default; None means no read deadline.
-        if hasattr(timeout, "read"):
-            read_timeout = getattr(timeout, "read")
-            timeout = float("inf") if read_timeout is None else read_timeout
+        reasoning_emitter = None
+        if not stream:
+            try:
+                from .live_reasoning import collector_emitter
+            except ImportError:
+                from live_reasoning import collector_emitter
+            reasoning_emitter = collector_emitter(
+                extra_kwargs.get("_agy_session_id"), extra_kwargs.get("_agy_request_token"), client=self
+            )
         effective_timeout = (
             float(timeout)
             if isinstance(timeout, (int, float)) and timeout > 0
@@ -662,6 +660,7 @@ class AntigravityClient:
                         rules_in_workspace=rules,
                     )
 
+                thinking_reader = ThinkingReader.before_request(self._isolated_gemini_dir)
                 event_msg = {"event": "user", "message": {"content": prompt_payload}}
                 try:
                     proc.stdin.write(json.dumps(event_msg) + "\n")
@@ -673,6 +672,8 @@ class AntigravityClient:
                         messages_list, model=resolved_model, tools=tools, tool_choice=tool_choice,
                         rules_in_workspace=rules,
                     )
+                    thinking_reader.close()
+                    thinking_reader = ThinkingReader.before_request(self._isolated_gemini_dir)
                     event_msg = {"event": "user", "message": {"content": prompt_payload}}
                     proc.stdin.write(json.dumps(event_msg) + "\n")
                     proc.stdin.flush()
@@ -690,11 +691,12 @@ class AntigravityClient:
                     worker_lock_held=worker_acquired,
                     messages=messages_list,
                     usage_baseline=worker_usage_baseline,
+                    thinking_reader=thinking_reader,
                 )
                 if stream:
                     return stream_iter
                 try:
-                    return collect_stream_completion(stream_iter)
+                    return collect_stream_completion(stream_iter, reasoning_emitter=reasoning_emitter)
                 finally:
                     if self._worker_lock.locked():
                         self._worker_lock.release()
@@ -712,4 +714,5 @@ class AntigravityClient:
                 tools=tools,
                 tool_choice=tool_choice,
                 stream=stream,
+                reasoning_emitter=reasoning_emitter,
             )

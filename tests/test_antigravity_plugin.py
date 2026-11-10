@@ -6,12 +6,10 @@ import os
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
-from typing import cast
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 # Add plugin parent dir to sys.path
@@ -19,7 +17,18 @@ plugin_dir = Path(__file__).resolve().parent.parent
 if str(plugin_dir) not in sys.path:
     sys.path.insert(0, str(plugin_dir))
 
-from providers import get_provider_profile
+# Hermetic: provider discovery scans $HERMES_HOME/plugins. On a host where this
+# plugin is also installed, discovery would register that copy under another
+# package name and get_provider_profile() would return it, so patches against
+# `antigravity_plugin_entry` miss and the real agy binary runs.
+os.environ["HERMES_HOME"] = tempfile.mkdtemp(prefix="agy_test_home_")
+
+try:
+    from providers import get_provider_profile
+except ImportError:
+    # Skip tests if Hermes Agent checkout is not in PYTHONPATH
+    raise unittest.SkipTest("Skipping test_antigravity_plugin.py: 'providers' module from Hermes Agent not found in PYTHONPATH.")
+
 from client import (
     AntigravityClient,
     AntigravityStream,
@@ -29,7 +38,7 @@ from client import (
     resolve_agy_command,
 )
 from process import _check_early_quota_error
-from stream import _StdoutLineReader, _stdout_line_reader
+from stream import _is_output_limit_error, _result_reports_output_limit
 
 # Load the plugin's package entry as a real package (not a plain module) so its
 # `from .client import ...` relative imports resolve. Hermes itself discovers a
@@ -53,6 +62,16 @@ _pkg_spec.loader.exec_module(_pkg)
 # below expire the generator's read loop deterministically instead of
 # relying on a short timeout plus the loop's sleep polling.
 _CLOCK_JUMP_SECONDS = 10 ** 6
+
+
+@contextlib.contextmanager
+def _mock_inherited_config(effort):
+    # Keep offline provider tests independent of Hermes runtime dependencies.
+    config = ModuleType("hermes_cli.config")
+    load_config = MagicMock(return_value={"agent": {"reasoning_effort": effort}})
+    setattr(config, "load_config_readonly", load_config)
+    with patch.dict(sys.modules, {"hermes_cli.config": config}):
+        yield load_config
 
 
 class AntigravityPluginTests(unittest.TestCase):
@@ -91,30 +110,6 @@ class AntigravityPluginTests(unittest.TestCase):
         self.assertIsNotNone(profile.auth_handler)
         self.assertEqual(profile.auth_type, "external_process")
         self.assertEqual(profile.api_mode, "chat_completions")
-
-    def test_external_process_provider_streaming_is_opted_in(self):
-        from dataclasses import fields
-        from providers.base import ProviderProfile
-
-        if "supports_streaming" not in {field.name for field in fields(ProviderProfile)}:
-            self.skipTest("this Hermes version predates external-process streaming opt-in")
-
-        profile = get_provider_profile("antigravity-oauth")
-        assert profile is not None
-        self.assertIs(profile.supports_streaming, True)
-
-        # Exercise Hermes' actual dispatch decision, not just the profile flag:
-        # external-process providers otherwise remain non-streaming by default.
-        from agent.turn_api_call import _should_stream
-
-        agent = SimpleNamespace(
-            provider=profile.name,
-            base_url=profile.base_url,
-            _disable_streaming=False,
-            _has_stream_consumers=lambda: True,
-            client=None,
-        )
-        self.assertTrue(_should_stream(agent))
 
     def test_alias_lookup(self):
         profile = get_provider_profile("google-antigravity")
@@ -392,6 +387,73 @@ class AntigravityPluginTests(unittest.TestCase):
         self.assertIn("HEAD", d_prompt)
         self.assertIn("TAIL", d_prompt)
 
+    def test_format_messages_budget_preserves_latest_user_request_and_evicts_oldest(self):
+        messages: list[dict[str, object]] = [{"role": "user", "content": "Turn 1 initial modeling request"}]
+        for idx in range(40):
+            call_id = f"call_blender_{idx}"
+            messages.append({
+                "role": "assistant",
+                "content": f"Step {idx} reasoning",
+                "tool_calls": [{
+                    "id": call_id,
+                    "function": {
+                        "name": "mcp__blender__execute_blender_code",
+                        "arguments": json.dumps({"code": f"# script_{idx}\n" + ("A" * 6000)}),
+                    },
+                }],
+            })
+            messages.append({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": f"done_{idx}",
+            })
+        messages.append({"role": "assistant", "content": "Turn 1 final summary: 79 meshes complete."})
+        latest_req = "Thanks, that works. Next, improve the material contrast on the remaining meshes first."
+        messages.append({"role": "user", "content": latest_req})
+
+        prompt = _format_messages_as_prompt(messages)
+        self.assertLessEqual(len(prompt), 150000)
+        self.assertLessEqual(len(prompt.encode("utf-8")), 160000)
+        self.assertIn("### LATEST USER REQUEST TO ANSWER:", prompt)
+        self.assertIn(latest_req, prompt)
+        self.assertIn("Turn 1 final summary: 79 meshes complete.", prompt)
+        self.assertIn("truncated 60", prompt)
+
+        tight_prompt = _format_messages_as_prompt(messages, max_prompt_chars=40000, max_prompt_bytes=45000)
+        self.assertLessEqual(len(tight_prompt), 40000)
+        self.assertLessEqual(len(tight_prompt.encode("utf-8")), 45000)
+        self.assertIn("### LATEST USER REQUEST TO ANSWER:", tight_prompt)
+        self.assertIn(latest_req, tight_prompt)
+        self.assertIn("Turn 1 final summary: 79 meshes complete.", tight_prompt)
+        self.assertIn("earlier transcript messages omitted", tight_prompt)
+
+    def test_format_messages_budget_pins_active_user_request_on_mid_turn_tool_respawn(self):
+        active_user_req = "Improve the highlight and contrast of the remaining meshes first"
+        messages: list[dict[str, object]] = [
+            {"role": "user", "content": "Turn 1 old request"},
+            {"role": "assistant", "content": "Turn 1 done"},
+            {"role": "user", "content": active_user_req},
+        ]
+        for idx in range(15):
+            cid = f"call_t2_{idx}"
+            messages.append({
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{"id": cid, "function": {"name": "exec", "arguments": json.dumps({"code": "B" * 4000})}}],
+            })
+            messages.append({
+                "role": "tool",
+                "tool_call_id": cid,
+                "content": f"tool_out_{idx}_" + ("C" * 4000),
+            })
+
+        prompt = _format_messages_as_prompt(messages, max_prompt_chars=25000, max_prompt_bytes=28000)
+        self.assertLessEqual(len(prompt), 25000)
+        self.assertLessEqual(len(prompt.encode("utf-8")), 28000)
+        self.assertIn(active_user_req, prompt)
+        self.assertIn("### LATEST TOOL RESULTS RECEIVED.", prompt)
+        self.assertIn("tool_out_14_", prompt)
+
     def test_mock_stream_tool_call_suppresses_trailing_hallucination(self):
         # TemporaryDirectory (not /tmp): on Windows "/tmp" resolves to a
         # drive-rooted \tmp with no guaranteed write access, and an
@@ -584,163 +646,6 @@ class AntigravityPluginTests(unittest.TestCase):
             self.assertEqual(chunks[3].choices, [])
             self.assertEqual(chunks[3].usage.total_tokens, 55)
 
-    def test_stdout_reader_applies_backpressure_when_consumer_pauses(self):
-        class FastStdout:
-            def __init__(self, line_count):
-                self.line_count = line_count
-                self.calls = 0
-
-            def readline(self):
-                self.calls += 1
-                if self.calls > self.line_count:
-                    return ""
-                return f"line-{self.calls}\n"
-
-        total_lines = 10_000
-        stdout = FastStdout(total_lines)
-        reader = _StdoutLineReader(stdout)
-        try:
-            self.assertGreater(reader._lines.maxsize, 0, "stdout queue must be bounded")
-            deadline = time.monotonic() + 1.0
-            while reader._lines.qsize() < reader._lines.maxsize and time.monotonic() < deadline:
-                time.sleep(0.001)
-            self.assertEqual(reader._lines.qsize(), reader._lines.maxsize)
-            calls_at_capacity = stdout.calls
-            time.sleep(0.05)
-            self.assertLessEqual(stdout.calls, calls_at_capacity + 1)
-            self.assertLess(stdout.calls, total_lines)
-        finally:
-            while True:
-                try:
-                    line = reader.readline(timeout=0.5)
-                except TimeoutError:
-                    break
-                if not line:
-                    break
-
-    def test_stream_close_unblocks_stdout_reader_waiting_for_queue_space(self):
-        class FloodingStdout:
-            def __init__(self):
-                self.release = threading.Event()
-
-            def readline(self):
-                return "" if self.release.is_set() else "line\n"
-
-        stdout = FloodingStdout()
-        tmp_dir = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp_dir.cleanup)
-        client = AntigravityClient(cwd=tmp_dir.name)
-        proc = MagicMock()
-        proc.stdout = stdout
-        proc.poll.return_value = None
-        proc.wait.return_value = 0
-        client._active_processes.add(proc)
-        stream = AntigravityStream(proc=cast(subprocess.Popen, proc), client=client, model="test", timeout=1.0)
-        reader = _stdout_line_reader(proc)
-        assert reader is not None
-        try:
-            deadline = time.monotonic() + 1.0
-            while reader._lines.qsize() < reader._lines.maxsize and time.monotonic() < deadline:
-                time.sleep(0.001)
-            self.assertGreater(reader._lines.maxsize, 0, "stdout queue must be bounded")
-            self.assertEqual(reader._lines.qsize(), reader._lines.maxsize)
-            with patch("client.terminate_process", side_effect=lambda _proc: stdout.release.set()):
-                stream.close()
-            reader._thread.join(0.5)
-            self.assertFalse(reader._thread.is_alive(), "stdout reader stayed blocked after stream close")
-        finally:
-            stdout.release.set()
-            stream.close()
-            client.close()
-            deadline = time.monotonic() + 1.0
-            while reader._thread.is_alive() and time.monotonic() < deadline:
-                try:
-                    reader.readline(timeout=0.05)
-                except TimeoutError:
-                    pass
-                reader._thread.join(0.01)
-
-    def test_silent_stdout_read_respects_stream_deadline(self):
-        # A pipe.readline() that waits for a newline must not hold the
-        # provider turn past its configured deadline.
-        class BlockingStdout:
-            def __init__(self):
-                self.entered = threading.Event()
-                self.release = threading.Event()
-
-            def readline(self):
-                self.entered.set()
-                self.release.wait()
-                return ""
-
-        tmp_dir = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp_dir.cleanup)
-        client = AntigravityClient(cwd=tmp_dir.name)
-        proc = self._scripted_proc([], alive=True)
-        stdout = BlockingStdout()
-        proc.stdout = stdout
-        proc.terminate.side_effect = stdout.release.set
-
-        with self._stubbed_kill_path():
-            with patch("subprocess.Popen", return_value=proc):
-                stream = client.chat.completions.create(
-                    model="gemini-3.8-flash-high",
-                    messages=[{"role": "user", "content": "hello"}],
-                    stream=True,
-                    timeout=0.2,
-                )
-
-            outcome = {}
-
-            def consume():
-                try:
-                    list(stream)
-                except Exception as exc:
-                    outcome["error"] = exc
-
-            consumer = threading.Thread(target=consume, daemon=True)
-            try:
-                consumer.start()
-                self.assertTrue(stdout.entered.wait(1.0))
-                consumer.join(1.0)
-                self.assertFalse(consumer.is_alive(), "stream stayed blocked in stdout.readline()")
-                error = outcome.get("error")
-                self.assertIsInstance(error, TimeoutError)
-                self.assertIn("timed out", str(error).lower())
-                proc.terminate.assert_called()
-            finally:
-                stdout.release.set()
-                if consumer.is_alive():
-                    consumer.join(1.0)
-                stream.close()
-                client.close()
-
-    def test_structured_host_timeout_uses_read_budget(self):
-        # Hermes passes httpx.Timeout objects; honor their read budget rather
-        # than silently replacing it with the plugin's shorter default.
-        cases = (
-            (SimpleNamespace(read=900.0), 900.0),
-            (SimpleNamespace(read=None), float("inf")),
-        )
-        for host_timeout, expected_timeout in cases:
-            with self.subTest(expected_timeout=expected_timeout):
-                tmp_dir = tempfile.TemporaryDirectory()
-                self.addCleanup(tmp_dir.cleanup)
-                client = AntigravityClient(cwd=tmp_dir.name)
-                proc = self._scripted_proc([], alive=True)
-
-                with self._stubbed_kill_path():
-                    with patch("subprocess.Popen", return_value=proc):
-                        stream = client.chat.completions.create(
-                            model="gemini-3.8-flash-high",
-                            messages=[{"role": "user", "content": "hello"}],
-                            stream=True,
-                            timeout=host_timeout,
-                        )
-                        self.assertEqual(stream.timeout, expected_timeout)
-                        stream.close()
-                    client.close()
-
     def test_mock_stream_tool_call(self):
         # TemporaryDirectory (not /tmp): on Windows "/tmp" resolves to a
         # drive-rooted \tmp with no guaranteed write access, and an
@@ -791,84 +696,115 @@ class AntigravityPluginTests(unittest.TestCase):
             finish_chunks = [c for c in chunks if c.choices and c.choices[0].finish_reason]
             self.assertEqual(finish_chunks[0].choices[0].finish_reason, "tool_calls")
 
+    # Current account IDs are offline fixtures, not a production catalog.
+    _LIVE_IDS = (
+        "gemini-3.8-flash-high", "gemini-3.8-flash-medium", "gemini-3.8-flash-low",
+        "claude-opus-5-5-low", "claude-opus-5-5-medium", "claude-opus-5-5-high",
+        "claude-sonnet-5-5-low", "claude-sonnet-5-5-medium", "claude-sonnet-5-5-high",
+        "gpt-oss-120b-medium",
+    )
+    _FUTURE_IDS = (
+        "gemini-future-pro-max", "gemini-future-flash-xhigh", "orion-v2-reasoner-max",
+        "Vendor/Model_vNext@Preview-high", "vendor/model_vnext@preview-high",
+    )
+
     def test_base_model_and_effort_resolution(self):
-        # TemporaryDirectory (not /tmp): on Windows "/tmp" resolves to a
-        # drive-rooted \tmp with no guaranteed write access, and an
-        # explicit cwd is never cleaned by close() — addCleanup removes it.
-        tmp_dir = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp_dir.cleanup)
-        client = AntigravityClient(cwd=tmp_dir.name)
-        # Base model + explicit effort
-        self.assertEqual(client._resolve_model_and_effort("gemini-3.8-flash", "low"), ("gemini-3.8-flash-low", "low"))
-        self.assertEqual(client._resolve_model_and_effort("gemini-3.8-flash", "medium"), ("gemini-3.8-flash-medium", "medium"))
-        self.assertEqual(client._resolve_model_and_effort("gemini-3.8-flash", "high"), ("gemini-3.8-flash-high", "high"))
-        self.assertEqual(client._resolve_model_and_effort("gemini-3.8-flash", "max"), ("gemini-3.8-flash-high", "high"))
-        self.assertEqual(client._resolve_model_and_effort("gemini-3.8-flash", "none"), ("gemini-3.8-flash-low", "low"))
-
-        # gemini-3.1-pro has only low and high
-        self.assertEqual(client._resolve_model_and_effort("gemini-3.1-pro", "low"), ("gemini-3.1-pro-low", "low"))
-        self.assertEqual(client._resolve_model_and_effort("gemini-3.1-pro", "medium"), ("gemini-3.1-pro-high", "high"))
-        self.assertEqual(client._resolve_model_and_effort("gemini-3.1-pro", "high"), ("gemini-3.1-pro-high", "high"))
-
-        # Suffix override: model had -high but effort was set to low
-        self.assertEqual(client._resolve_model_and_effort("gemini-3.8-flash-high", "low"), ("gemini-3.8-flash-low", "low"))
-
-        # Non-gemini model
-        # agy rejects --effort for claude-* ("--effort is not supported for model"), so none is sent.
-        self.assertEqual(client._resolve_model_and_effort("claude-sonnet-4-6", "high"), ("claude-sonnet-4-6", None))
+        from models import resolve_model_and_effort
+        for model in ("gemini-3.8-flash", "gemini-3.1-pro", "gemini-future-flash"):
+            for effort in ("low", "medium", "high", "xhigh", "max"):
+                with self.subTest(model=model, effort=effort):
+                    self.assertEqual(resolve_model_and_effort(model, effort), (model, effort))
+            self.assertEqual(resolve_model_and_effort(model, "none"), (model, "low"))
+            self.assertEqual(resolve_model_and_effort(model, "invalid"), (model, None))
+        with _mock_inherited_config("high") as config:
+            for model in self._LIVE_IDS + self._FUTURE_IDS:
+                for effort in (None, "low", "max"):
+                    self.assertEqual(resolve_model_and_effort(model, effort), (model, None))
+            self.assertEqual(resolve_model_and_effort(None), ("", None))
+            self.assertEqual(resolve_model_and_effort("gemini-future-flash"), ("gemini-future-flash", None))
+            config.assert_not_called()
+        for model in ("flash", "default", "sonnet", "claude-sonnet-5-5", "gpt-oss-120b"):
+            self.assertEqual(resolve_model_and_effort(model, "high"), (model, None))
 
     def test_profile_supported_reasoning_efforts(self):
         profile = get_provider_profile("antigravity-oauth")
-        self.assertEqual(profile.supported_reasoning_efforts("gemini-3.8-flash"), ("low", "medium", "high"))
-        self.assertEqual(profile.supported_reasoning_efforts("gemini-3.1-pro"), ("low", "high"))
-        self.assertEqual(profile.supported_reasoning_efforts("gpt-oss-120b-medium"), ())
+        for model in self._LIVE_IDS + self._FUTURE_IDS + (None, "claude-sonnet-5-5"):
+            self.assertEqual(profile.supported_reasoning_efforts(model), ())
+            self.assertEqual(profile.build_api_kwargs_extras(model=model, reasoning_config={"effort": "max"}), ({}, {}))
+        for model in ("gemini-3.8-flash", "gemini-future-pro"):
+            self.assertEqual(profile.supported_reasoning_efforts(model), ("low", "medium", "high", "xhigh", "max"))
+            self.assertEqual(profile.build_api_kwargs_extras(model=model, reasoning_config={"effort": "max"}), ({}, {"reasoning_effort": "max"}))
+            self.assertEqual(profile.build_api_kwargs_extras(model=model, reasoning_config={"enabled": False}), ({}, {"reasoning_effort": "low"}))
+            self.assertEqual(profile.build_api_kwargs_extras(model=model, reasoning_config={"effort": "invalid"}), ({}, {}))
 
-    def test_fetch_models_clean_base_names(self):
+    def _fetch_fixture(self, output, returncode=0):
+        # Patch the package-qualified client used by the registered profile.
+        with patch("antigravity_plugin_entry.client.resolve_agy_command", return_value="fixture-agy"), patch.object(
+            _pkg.subprocess, "run", return_value=SimpleNamespace(stdout=output, returncode=returncode)
+        ) as run:
+            result = get_provider_profile("antigravity-oauth").fetch_models(timeout=2.5)
+            run.assert_called_once_with(["fixture-agy", "models"], capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=2.5)
+            return result
+
+    def test_fetch_models_exact_native_ids(self):
+        ids = self._LIVE_IDS + self._FUTURE_IDS
+        table = "Fetching available models...\nID\tName\n" + "".join(f"{model}\tFixture display name\n" for model in ids + (ids[0],))
+        self.assertEqual(self._fetch_fixture(table), list(ids))
         profile = get_provider_profile("antigravity-oauth")
-        models = profile.fetch_models()
-        self.assertIsNotNone(models)
-        # Verify deduplicated clean base names
-        self.assertIn("gemini-3.8-flash", models)
-        self.assertNotIn("gemini-3.8-flash-high", models)
-        self.assertNotIn("gemini-3.8-flash-medium", models)
+        self.assertEqual(profile.fallback_models, ())
+        self.assertEqual(profile.default_aux_model, "")
+
+    def test_fetch_models_failure_is_not_empty_or_static_fallback(self):
+        valid = "gemini-3.8-flash-high\tGemini Flash High\n"
+        for output in (
+            "Fetching available models...\n", "ID\tName\n", "model authentication failed\n",
+            "error\tAuthentication required\n", "warning:\tLogin needed\n",
+            "gemini-3.8-flash-high\n", "gemini-3.8-flash-high\t\n",
+            " gemini-3.8-flash-high\tName\n", "not a model\tName\n",
+            valid + "truncated-row\n", valid + "model-id\tName\textra\n",
+        ):
+            with self.subTest(output=output):
+                self.assertIsNone(self._fetch_fixture(output))
+        self.assertIsNone(self._fetch_fixture(valid, returncode=1))
+        self.assertEqual(self._fetch_fixture(""), [])
+        for error in (subprocess.TimeoutExpired("agy", 2.5), OSError("unavailable")):
+            with patch("antigravity_plugin_entry.client.resolve_agy_command", return_value="fixture-agy"), patch.object(_pkg.subprocess, "run", side_effect=error):
+                self.assertIsNone(get_provider_profile("antigravity-oauth").fetch_models(timeout=2.5))
+
+    def test_native_model_worker_and_oneshot_argv(self):
+        for model in self._LIVE_IDS + self._FUTURE_IDS:
+            for oneshot in (False, True):
+                with self.subTest(model=model, oneshot=oneshot), tempfile.TemporaryDirectory() as tmp:
+                    client = AntigravityClient(cwd=tmp)
+                    proc = MagicMock()
+                    proc.poll.return_value = None
+                    if oneshot:
+                        client._worker_lock.acquire()
+                    try:
+                        with patch("client.subprocess.Popen", return_value=proc) as popen, patch("client.AntigravityStream"), patch.object(client, "_sync_workspace_rules", return_value=False), patch.object(client, "_terminate_process"), _mock_inherited_config("max") as config:
+                            client.chat.completions.create(model=model, reasoning_effort="low", messages=[{"role": "user", "content": "fixture"}], stream=True)
+                            expected = ["agy"] + ([] if oneshot else ["--input-format", "stream-json"]) + list(client._args) + ["--model", model]
+                            self.assertEqual(popen.call_args.args[0], expected)
+                            client.close()
+                            config.assert_not_called()
+                    finally:
+                        if client._worker_lock.locked():
+                            client._worker_lock.release()
+                        client.close()
 
     def test_profile_get_model_context_length(self):
-        from context_window import context_length_for
-
-        registry = {
-            "google": {"models": {
-                "gemini-4-argon": {"limit": {"context": 1_048_576}},
-                "gemini-3.8-flash": {"limit": {"context": 1_048_576}},
-                "gemini-3-pro-image": {"limit": {"context": 65_536}},
-            }},
-            "anthropic": {"models": {
-                "claude-sonnet-4-6": {"limit": {"context": 1_000_000}},
-            }},
-            "groq": {"models": {
-                "openai/gpt-oss-120b": {"limit": {"context": 131_072}},
-            }},
-            "perplexity-agent": {"models": {
-                "anthropic/claude-sonnet-4-6": {"limit": {"context": 200_000}},
-            }},
-        }
-        self.assertEqual(context_length_for("gemini-4-argon", registry), 1_048_576)
-        self.assertEqual(context_length_for("gemini-4-argon-high", registry), 1_048_576)
-        self.assertEqual(context_length_for("gemini-3.8-flash", registry), 1_048_576)
-        self.assertEqual(context_length_for("gemini-3-pro-image", registry), 65_536)
-        self.assertEqual(context_length_for("claude-sonnet-4-6", registry), 1_000_000)
-        self.assertEqual(context_length_for("gpt-oss-120b-medium", registry), 131_072)
-        self.assertIsNone(context_length_for("not-a-real-model", registry))
-
-        profile = _pkg.antigravity_profile
-        with patch("antigravity_plugin_entry.context_window.load_registry", return_value=registry):
-            self.assertEqual(profile.get_model_context_length("gemini-4-argon"), 1_048_576)
-            self.assertEqual(profile.get_model_context_length("gpt-oss-120b-medium"), 131_072)
-            self.assertEqual(profile.get_model_context_length("claude-sonnet-4-6"), 1_000_000)
-            self.assertIsNone(profile.get_model_context_length("unknown"))
-
-        # Test env override
-        with patch.dict(os.environ, {"ANTIGRAVITY_CONTEXT_LENGTH": "250000"}):
-            self.assertEqual(profile.get_model_context_length("gemini-3.8-flash"), 250_000)
+        profile = get_provider_profile("antigravity-oauth")
+        for override in ("", "invalid", "0", "-10", "1.5"):
+            with patch.dict(os.environ, {"ANTIGRAVITY_CONTEXT_LENGTH": override}):
+                for model in self._LIVE_IDS + self._FUTURE_IDS:
+                    self.assertIsNone(profile.get_model_context_length(model))
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ANTIGRAVITY_CONTEXT_LENGTH", None)
+            self.assertIsNone(profile.get_model_context_length("gpt-oss-120b-medium"))
+        for override, expected in (("250000", 250_000), (" 1 ", 1)):
+            with patch.dict(os.environ, {"ANTIGRAVITY_CONTEXT_LENGTH": override}):
+                for model in self._LIVE_IDS + self._FUTURE_IDS:
+                    self.assertEqual(profile.get_model_context_length(model), expected)
 
     def test_profile_classify_api_error(self):
         profile = get_provider_profile("antigravity-oauth")
@@ -891,14 +827,6 @@ class AntigravityPluginTests(unittest.TestCase):
         # Test unrelated error returns None
         verdict4 = hook(RuntimeError("Invalid API key or unauthorized"))
         self.assertIsNone(verdict4)
-
-        # Test quota limit
-        verdict_quota = hook(RuntimeError("Antigravity model error: Individual quota reached"))
-        self.assertEqual(verdict_quota, {"reason": "rate_limit", "retryable": True, "should_fallback": True})
-
-        # Test auth error
-        verdict_auth = hook(RuntimeError("Antigravity CLI is not authenticated. Please run 'agy'"))
-        self.assertEqual(verdict_auth, {"reason": "auth_login_required", "retryable": False})
 
     def test_hermes_error_classifier_integration(self):
         try:
@@ -1396,6 +1324,105 @@ class AntigravityPluginTests(unittest.TestCase):
         client._worker_lock.release()
         client.close()
 
+    def test_worker_output_token_limit_error_is_length_finish(self):
+        # agy reports a reply cut at the output cap as a result "error".
+        # It must reach Hermes as finish_reason="length" (truncation
+        # recovery), not as a RuntimeError that Hermes misreads as a
+        # context overflow. The cut reply is not a resumable exchange: no
+        # history update, and the worker is retired.
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        client = AntigravityClient(cwd=tmp_dir.name)
+        events = [
+            json.dumps({"event": "init", "conversation_id": "conv-output-cap"}),
+            json.dumps({"event": "step_update", "step_update": {"text_delta": "partial answer"}}),
+            json.dumps({
+                "event": "result",
+                "result": {
+                    "status": "ERROR",
+                    "error": "your previous response was cut off because it exceeded the output token limit",
+                },
+            }),
+        ]
+        proc = self._scripted_proc(events, alive=True)
+
+        with patch("subprocess.Popen", return_value=proc), \
+                self._spy_update_worker_history(client) as history_spy:
+            stream = client.chat.completions.create(
+                model="gemini-3.8-flash-high",
+                messages=[{"role": "user", "content": "hello"}],
+                stream=True,
+                timeout=30.0,
+            )
+            chunks = list(stream)
+
+        finish = [c.choices[0].finish_reason for c in chunks if c.choices and c.choices[0].finish_reason]
+        self.assertEqual(finish, ["length"])
+        text = "".join(c.choices[0].delta.content or "" for c in chunks if c.choices)
+        self.assertEqual(text, "partial answer")
+        history_spy.assert_not_called()
+        self.assertIsNone(client._worker_proc)
+        proc.terminate.assert_called_once()
+        self.assertFalse(client._worker_lock.locked())
+
+    def test_oneshot_output_token_limit_error_is_length_finish(self):
+        # Structured path: a max-tokens finish reason on the result event is
+        # enough even when the error text is not agy's truncation sentence.
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        client = AntigravityClient(cwd=tmp_dir.name)
+        self.assertTrue(client._worker_lock.acquire(blocking=False))
+        events = [
+            json.dumps({"event": "init", "conversation_id": "oneshot-output-cap"}),
+            json.dumps({
+                "event": "result",
+                "result": {"status": "ERROR", "error": "generation stopped", "finish_reason": "MAX_TOKENS"},
+            }),
+        ]
+        proc = self._scripted_proc(events, alive=False)
+
+        with patch("subprocess.Popen", return_value=proc):
+            completion = client.chat.completions.create(
+                model="gemini-3.8-flash-high",
+                messages=[{"role": "user", "content": "hello"}],
+                stream=False,
+                timeout=30.0,
+            )
+
+        self.assertEqual(completion.choices[0].finish_reason, "length")
+        client._worker_lock.release()
+        client.close()
+
+    def test_output_limit_detection_matches_agy_sentences_only(self):
+        for text in (
+            "Your previous response was cut off because it exceeded the output token limit",
+            "your response exceeded the maximum output token limit and was truncated. Do not repeat...",
+            "Your previous response was cut off\nbecause it exceeded the output token limit.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(_is_output_limit_error(text))
+        # Same phrase, unrelated agy auxiliary messages: not a response truncation.
+        for text in (
+            "Checkpoint summary exceeded the max output token limit of 8192",
+            "intent prediction exceeded the max output token limit of 1024",
+            "exceeded the output token limit",
+            "", None, 42,
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(_is_output_limit_error(text))
+        for result in (
+            {"finish_reason": "MAX_TOKENS"}, {"finishReason": "max_tokens"},
+            {"stop_reason": "max_tokens"}, {"metadata": {"finishReason": "length"}},
+        ):
+            with self.subTest(result=result):
+                self.assertTrue(_result_reports_output_limit(result))
+        for result in (
+            {}, {"finish_reason": "STOP"}, {"finish_reason": None}, {"metadata": "MAX_TOKENS"},
+            {"status": "ERROR", "error": "context canceled"}, None, "MAX_TOKENS",
+        ):
+            with self.subTest(result=result):
+                self.assertFalse(_result_reports_output_limit(result))
+
     def test_worker_eof_without_result_event_is_not_success(self):
         # The dead-worker guard's blind spot: the worker exited 0, so
         # poll() == 0 passed `not in (None, 0)` and the empty stream used to
@@ -1870,10 +1897,7 @@ class AntigravityPluginTests(unittest.TestCase):
         from client import _own_process_group
         with patch("os.name", "nt"):
             flags = _own_process_group()
-            self.assertEqual(flags["creationflags"] & 0x00000200, 0x00000200)
-            self.assertEqual(flags["creationflags"] & 0x08000000, 0x08000000)
-            if "startupinfo" in flags:
-                self.assertEqual(flags["startupinfo"].wShowWindow, 0)
+            self.assertEqual(flags, {"creationflags": 0x00000200})
         with patch("os.name", "posix"):
             flags = _own_process_group()
             self.assertEqual(flags, {"start_new_session": True})

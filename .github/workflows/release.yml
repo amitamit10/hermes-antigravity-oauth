@@ -40,6 +40,12 @@ jobs:
         with:
           node-version: "24"
 
+      - name: Install Hermes runtime dependencies
+        # Tests import Hermes main, which loads these at import time. Hermes
+        # declares its core deps only for Python 3.14 (and that set does not
+        # currently resolve), so `pip install -e .hermes-agent` is not usable.
+        run: pip install openai "ruamel.yaml" psutil python-dotenv httpx requests pyyaml
+
       - name: Python tests
         env:
           PYTHONPATH: ${{ github.workspace }}/.hermes-agent:${{ github.workspace }}
